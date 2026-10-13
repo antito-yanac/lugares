@@ -2,15 +2,12 @@
 //
 // Panel de Alertas — Antamina
 // ============================================================
-// v4 (2026): rediseño completo del panel de operador.
-//
-//  - 4 tarjetas de sector con checkbox + nivel + duración.
-//  - Sección de alertas activas en tiempo real (con contadores).
-//  - Liberar zona individual o todas (con confirmación).
-//  - Atajos de teclado: Shift+A/N/R sobre la última zona tocada,
-//    1/2/3/4 para toggle, Ctrl+Enter para enviar.
-//  - Mensaje informativo colapsable (opcional, secundario).
-//  - Firestore: cada zona se envía como doc independiente.
+// v5 (2026): oculta Zona 4 - Tajo del panel manual.
+//   - El scraper de Keraunos sigue funcionando con las 4 zonas.
+//   - index.html sigue mostrando alertas de Tajo si el scraper
+//     las detecta.
+//   - Solo el operador no puede crear alertas manuales de Tajo.
+//   - Reactivable con 1 palabra: oculta: true → oculta: false.
 // ============================================================
 
 import { inicializarFirebase, mostrarToast } from "./notifications.js";
@@ -25,11 +22,16 @@ import { obtenerApp } from "./firebase-app.js";
 // ======================================================
 // ZONAS OFICIALES (fuente única)
 // ======================================================
+// - `oculta: true`  → no se muestra en el panel manual.
+// - El scraper sigue enviando alertas de TODAS las zonas.
 const ZONAS = [
-    { distrito: "Zona 1 - Campamentos",   sectorOriginal: "Campamento Yanacancha", lat: -9.5822364, lng: -77.0223100, short: "1" },
-    { distrito: "Zona 2 - Botadero Este", sectorOriginal: "Oficinas Mina",         lat: -9.5718388, lng: -77.0447182, short: "2" },
-    { distrito: "Zona 3 - Tucush",        sectorOriginal: "Tucush",                lat: -9.5263487, lng: -77.0485794, short: "3" },
-    { distrito: "Zona 4 - Tajo",          sectorOriginal: "Tajo",                  lat: -9.5416465, lng: -77.0707659, short: "4" }
+    { distrito: "Zona 1 - Campamentos",   sectorOriginal: "Campamento Yanacancha", lat: -9.5822364, lng: -77.0223100, short: "1", oculta: false },
+    { distrito: "Zona 2 - Botadero Este", sectorOriginal: "Oficinas Mina",         lat: -9.5718388, lng: -77.0447182, short: "2", oculta: false },
+    { distrito: "Zona 3 - Tucush",        sectorOriginal: "Tucush",                lat: -9.5263487, lng: -77.0485794, short: "3", oculta: false },
+    // ⚠️ ZONA 4 OCULTA: no se muestra en el panel manual.
+    // Para reactivarla: cambiar oculta: true → oculta: false.
+    // El scraper de Keraunos sigue funcionando con las 4 zonas.
+    { distrito: "Zona 4 - Tajo",          sectorOriginal: "Tajo",                  lat: -9.5416465, lng: -77.0707659, short: "4", oculta: true  }
 ];
 
 const NIVELES_VALIDOS = ["amarilla", "naranja", "roja"];
@@ -76,10 +78,8 @@ const btnModalCancelar = document.getElementById("modal-btn-cancelar");
 // Estado
 // ======================================================
 const estado = {
-    // Config por zona: { activa:bool, nivel:string, duracionMin:number }
     config: {},
-    ultimaZonaTocada: null,   // distrito
-    // Alertas activas: Map<distrito, { nivel, timestampInicio, duracionMin, docId }>
+    ultimaZonaTocada: null,
     alertasActivas: new Map(),
     intervalContadores: null,
     intervalFirestore: null,
@@ -194,13 +194,11 @@ async function initPanel() {
 
         mostrarEstado("Panel listo. Configura las alertas y envía.", "");
 
-        // Cliente del scraper Keraunos (modo admin)
         try { iniciarEstadoCliente({ modo: "admin" }); }
         catch (e) { console.warn("estado-cliente (admin):", e); }
 
-        // Listener de alertas activas
         escucharAlertasActivas();
-        // Actualizar contadores cada segundo
+
         if (estado.intervalContadores) clearInterval(estado.intervalContadores);
         estado.intervalContadores = setInterval(actualizarContadores, 1000);
 
@@ -213,12 +211,15 @@ async function initPanel() {
 }
 
 // ======================================================
-// Render de las 4 tarjetas de sector
+// Render de las tarjetas de sector (solo las visibles)
 // ======================================================
 function renderSectores() {
     paNaLista.innerHTML = "";
 
     ZONAS.forEach(z => {
+        // Saltar zonas marcadas como ocultas (no se muestran en el panel)
+        if (z.oculta) return;
+
         const cfg = estado.config[z.distrito];
         const card = document.createElement("div");
         card.className = "pa-na-card";
@@ -282,13 +283,9 @@ function engancharEventos() {
         }
     });
 
-    // Botón enviar
     paBtnEnviar.addEventListener("click", onClickEnviar);
-
-    // Liberar todas
     paBtnLiberarTodas.addEventListener("click", onClickLiberarTodas);
 
-    // Mensaje informativo (toggle)
     paMiToggle.addEventListener("click", () => {
         const visible = paMiCampos.style.display !== "none";
         if (visible) {
@@ -300,7 +297,6 @@ function engancharEventos() {
         }
     });
 
-    // Contador caracteres
     inputCuerpo.addEventListener("input", () => {
         const len = inputCuerpo.value.length;
         charCounter.textContent = `${len} / 500`;
@@ -309,7 +305,6 @@ function engancharEventos() {
         if (len > 475) charCounter.classList.add("danger");
     });
 
-    // Atajos de teclado
     document.addEventListener("keydown", onKeyDown);
 }
 
@@ -330,7 +325,6 @@ function seleccionarNivel(distrito, nivel) {
     const cfg = estado.config[distrito];
     if (!cfg) return;
     cfg.nivel = nivel;
-    // Si la zona no estaba activa, activarla al elegir nivel
     if (!cfg.activa) cfg.activa = true;
     marcarUltimaTocada(distrito);
     aplicarEstadoVisual();
@@ -349,6 +343,8 @@ function marcarUltimaTocada(distrito) {
 // ======================================================
 function aplicarEstadoVisual() {
     ZONAS.forEach(z => {
+        if (z.oculta) return;
+
         const cfg = estado.config[z.distrito];
         const card = document.querySelector(`.pa-na-card[data-distrito="${cssEscape(z.distrito)}"]`);
         if (!card) return;
@@ -357,17 +353,14 @@ function aplicarEstadoVisual() {
         const dWrap = card.querySelector(".pa-duracion-wrap");
         const inputDur = card.querySelector(".pa-duracion-wrap input");
 
-        // Check
         if (cfg.activa) check.classList.add("pa-on");
         else check.classList.remove("pa-on");
 
-        // Color del borde según nivel (siempre visible, más fuerte si activa)
         card.classList.remove("pa-activa-amarilla", "pa-activa-naranja", "pa-activa-roja");
         if (cfg.activa) {
             card.classList.add(`pa-activa-${cfg.nivel}`);
         }
 
-        // Pills: marcar el seleccionado
         card.querySelectorAll(".pa-pill").forEach(p => {
             p.classList.remove("pa-sel-amarilla", "pa-sel-naranja", "pa-sel-roja");
             if (cfg.activa && p.dataset.nivel === cfg.nivel) {
@@ -375,11 +368,9 @@ function aplicarEstadoVisual() {
             }
         });
 
-        // Duración: disabled si no está activa
         if (cfg.activa) dWrap.classList.remove("pa-disabled");
         else dWrap.classList.add("pa-disabled");
 
-        // Valor
         if (inputDur && inputDur.value !== String(cfg.duracionMin)) {
             inputDur.value = String(cfg.duracionMin);
         }
@@ -417,6 +408,7 @@ function actualizarResumen() {
 function zonasSeleccionadas() {
     const out = [];
     for (const z of ZONAS) {
+        if (z.oculta) continue;   // ← zonas ocultas nunca se envían
         const cfg = estado.config[z.distrito];
         if (cfg.activa) {
             out.push({
@@ -498,7 +490,6 @@ async function enviarAlertas(activas) {
             }
         }
 
-        // Mensaje informativo opcional
         let okMsg = false;
         if (incluirMensaje) {
             if (!tituloMsg || !cuerpoMsg) {
@@ -543,6 +534,7 @@ async function enviarAlertas(activas) {
 // ======================================================
 function limpiarFormulario() {
     ZONAS.forEach(z => {
+        if (z.oculta) return;
         estado.config[z.distrito] = {
             activa: false,
             nivel: "amarilla",
@@ -552,7 +544,6 @@ function limpiarFormulario() {
     estado.ultimaZonaTocada = null;
     document.querySelectorAll(".pa-ultima-tocada").forEach(el => el.classList.remove("pa-ultima-tocada"));
 
-    // Mensaje informativo
     inputTitulo.value = "";
     inputCuerpo.value = "";
     charCounter.textContent = "0 / 500";
@@ -571,18 +562,10 @@ function escucharAlertasActivas() {
     try {
         const db = getFirestore(obtenerApp());
         const ref = collection(db, "mensajes_push");
-        // Traer los últimos 50 para reconstruir estado por distrito
         const q = query(ref, orderBy("fecha", "desc"), limit(50));
-
-        if (estado.intervalFirestore) {
-            // Nota: en Firestore onSnapshot devuelve un unsubscribe,
-            // aquí no lo guardamos porque es un panel de un solo uso.
-        }
 
         onSnapshot(q, (snap) => {
             const docs = snap.docs.map(d => ({ id: d.id, data: d.data() }));
-            // Más recientes primero. Procesar para determinar estado
-            // por distrito (el último doc manda).
             const estadoPorDistrito = new Map();
 
             for (const { id, data } of docs) {
@@ -590,7 +573,7 @@ function escucharAlertasActivas() {
                 if (tipo !== "alerta" && tipo !== "alerta-resuelta") continue;
                 const distrito = data.distrito;
                 if (!distrito) continue;
-                if (estadoPorDistrito.has(distrito)) continue; // ya hay uno más reciente
+                if (estadoPorDistrito.has(distrito)) continue;
 
                 if (tipo === "alerta-resuelta") {
                     estadoPorDistrito.set(distrito, { resuelta: true });
@@ -614,7 +597,6 @@ function escucharAlertasActivas() {
                 }
             }
 
-            // Refrescar el Map interno
             estado.alertasActivas.clear();
             for (const [distrito, info] of estadoPorDistrito.entries()) {
                 if (!info.resuelta) {
@@ -647,7 +629,6 @@ function renderAlertasActivas() {
     paAACount.textContent = `(${count})`;
     paAALista.innerHTML = "";
 
-    // Ordenar: roja > naranja > amarilla
     const orden = { roja: 3, naranja: 2, amarilla: 1 };
     const items = Array.from(estado.alertasActivas.entries())
         .sort((a, b) => (orden[b[1].nivel] || 0) - (orden[a[1].nivel] || 0));
@@ -674,12 +655,10 @@ function renderAlertasActivas() {
         paAALista.appendChild(item);
     }
 
-    // Enganchar botones de liberar
     paAALista.querySelectorAll(".pa-aa-btn-liberar").forEach(btn => {
         btn.addEventListener("click", () => onClickLiberarZona(btn.dataset.distrito));
     });
 
-    // Mostrar/ocultar "Liberar todas" según cantidad
     if (count >= 1) {
         paBtnLiberarTodas.style.display = "";
     } else {
@@ -809,43 +788,43 @@ async function liberarTodas(zonas) {
 // Atajos de teclado
 // ======================================================
 function onKeyDown(e) {
-    // Ignorar si está escribiendo en un input/textarea
     const t = e.target;
     const esInput = t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable;
 
-    // Ctrl+Enter → enviar
     if (e.ctrlKey && e.key === "Enter") {
         e.preventDefault();
         if (!paBtnEnviar.disabled) paBtnEnviar.click();
         return;
     }
 
-    // Ctrl+Shift+L → liberar todas
     if (e.ctrlKey && e.shiftKey && (e.key === "L" || e.key === "l")) {
         e.preventDefault();
         if (estado.alertasActivas.size > 0) onClickLiberarTodas();
         return;
     }
 
-    // Resto de atajos: no aplicar si se está escribiendo
     if (esInput) return;
-    // Ignorar si hay un modal abierto (excepto Escape que ya está manejado)
     if (modalConfirm.classList.contains("modal-visible")) return;
 
-    // 1, 2, 3, 4 → toggle zona
+    // 1, 2, 3, 4 → toggle zona (solo si la zona NO está oculta)
     if (["1", "2", "3", "4"].includes(e.key)) {
         e.preventDefault();
         const zona = ZONAS.find(z => z.short === e.key);
-        if (zona) toggleZona(zona.distrito);
+        if (zona && !zona.oculta) toggleZona(zona.distrito);
         return;
     }
 
-    // Shift + A/N/R → aplicar nivel a la última zona tocada
     if (e.shiftKey && !e.ctrlKey && !e.altKey) {
         const k = e.key.toUpperCase();
         if (k === "A" || k === "N" || k === "R") {
             if (!estado.ultimaZonaTocada) {
                 mostrarToast("⚠️ Sin zona", "Primero selecciona una zona con 1, 2, 3 o 4.", "alerta", false);
+                return;
+            }
+            // Validar que la última zona tocada no esté oculta
+            const zonaTocada = ZONAS.find(z => z.distrito === estado.ultimaZonaTocada);
+            if (zonaTocada && zonaTocada.oculta) {
+                mostrarToast("⚠️ Zona no disponible", "Esa zona está deshabilitada.", "alerta", false);
                 return;
             }
             const nivel = k === "A" ? "amarilla" : k === "N" ? "naranja" : "roja";
