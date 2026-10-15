@@ -1,23 +1,22 @@
 // js/alertas.js
 //
 // ============================================================
-// Sistema de Alerta Meteorológica — v3.4
+// Sistema de Alerta Meteorológica — v3.6
 // ------------------------------------------------------------
-// v3.4 (fix): CONTADOR MAESTRO ÚNICO.
-//   - Antes: cada banner tenía su propio setInterval, y
-//     cerrarBannerActual() detenía el contador. Resultado: al
-//     cerrar el overlay, la zona nunca expiraba y la barra/
-//     tarjeta quedaban congeladas.
-//   - Ahora: un solo interval (intervalMaestro) corre siempre
-//     que haya zonas activas, independiente de si el banner
-//     está visible o no. Revisa todas las zonas cada segundo,
-//     quita las expiradas y refresca la UI.
+// v3.6 (2026-10): DEGRADACIÓN SOLO PARA ALERTAS MANUALES.
+//   - Las alertas con origen === "manual" degradan:
+//       roja     → naranja (+1min) → amarilla (+1min) → libre
+//       naranja  → amarilla (+1min) → libre
+//       amarilla → libre
+//   - Las alertas del scraper (origen !== "manual") NO degradan:
+//       el contador llega a 0 y pasan a "libre" directamente.
+//   - Fix: overlay "libre" no parpadea antes de la alerta real.
 // ============================================================
 
 import { reproducirSonidoAlerta, detenerSonidoAlerta } from "./notifications.js";
 
 // ----------------------------------------------------------
-// Niveles de alerta
+// Niveles
 // ----------------------------------------------------------
 export const NIVELES_ALERTA = {
     vigilancia: {
@@ -51,7 +50,7 @@ export const NIVELES_ALERTA = {
 };
 
 // ----------------------------------------------------------
-// Medidas de seguridad por nivel
+// Medidas de seguridad
 // ----------------------------------------------------------
 const MEDIDAS_SEGURIDAD = {
     vigilancia: [
@@ -95,22 +94,61 @@ const SVG_RAYO = `
 </svg>`;
 
 // ----------------------------------------------------------
-// ESTADO INTERNO
+// ESTADO
 // ----------------------------------------------------------
 const estado = {
-    zonasActivas: new Map(),    // distrito -> { nivel, nivelKey, timestampInicio, duracionMin, ... }
+    zonasActivas: new Map(),
     colaBanners: [],
     bannerActual: null,
     intervalMaestro: null,
     intervalTimestamp: null
 };
 
-const capasRayos = new Map();  // distrito -> capaMapa
+const capasRayos = new Map();
 let libreYaCerradoPorUsuario = false;
+
 const DURACION_TIMER_MINUTOS = 15;
+const MINUTOS_DEGRADACION = 1;
 
 // ----------------------------------------------------------
-// Inyección del HTML base
+// CÁLCULO DEL NIVEL EFECTIVO (DEGRADACIÓN SOLO MANUAL)
+// ----------------------------------------------------------
+export function calcularNivelEfectivo(nivelOriginal, timestampInicio, duracionMin, origen = null) {
+    const elapsedMin = (Date.now() - timestampInicio) / 60000;
+    const D = duracionMin || DURACION_TIMER_MINUTOS;
+
+    // ⚠️ SOLO las alertas manuales degradan.
+    // Los docs del scraper (origen !== "manual") solo cuentan
+    // hacia abajo hasta "libre" y NO degradan.
+    if (origen !== "manual") {
+        if (elapsedMin < D) {
+            return {
+                nivel: nivelOriginal,
+                restanteSeg: Math.max(0, Math.ceil((D - elapsedMin) * 60))
+            };
+        }
+        return { nivel: "libre", restanteSeg: 0 };
+    }
+
+    // ---- Solo alertas MANUALES de aquí en adelante ----
+    if (nivelOriginal === "roja") {
+        if (elapsedMin < D)                 return { nivel: "roja",    restanteSeg: Math.max(0, Math.ceil((D - elapsedMin) * 60)) };
+        if (elapsedMin < D + MINUTOS_DEGRADACION)     return { nivel: "naranja", restanteSeg: Math.max(0, Math.ceil((D + MINUTOS_DEGRADACION - elapsedMin) * 60)) };
+        if (elapsedMin < D + 2 * MINUTOS_DEGRADACION) return { nivel: "amarilla",restanteSeg: Math.max(0, Math.ceil((D + 2 * MINUTOS_DEGRADACION - elapsedMin) * 60)) };
+        return { nivel: "libre", restanteSeg: 0 };
+    }
+    if (nivelOriginal === "naranja") {
+        if (elapsedMin < D)                 return { nivel: "naranja", restanteSeg: Math.max(0, Math.ceil((D - elapsedMin) * 60)) };
+        if (elapsedMin < D + MINUTOS_DEGRADACION)     return { nivel: "amarilla",restanteSeg: Math.max(0, Math.ceil((D + MINUTOS_DEGRADACION - elapsedMin) * 60)) };
+        return { nivel: "libre", restanteSeg: 0 };
+    }
+    // amarilla
+    if (elapsedMin < D)                     return { nivel: "amarilla", restanteSeg: Math.max(0, Math.ceil((D - elapsedMin) * 60)) };
+    return { nivel: "libre", restanteSeg: 0 };
+}
+
+// ----------------------------------------------------------
+// Inyección DOM
 // ----------------------------------------------------------
 function asegurarEstructuraDOM() {
     if (document.getElementById("al-overlay")) return;
@@ -179,9 +217,7 @@ function asegurarEstructuraDOM() {
 
     const cont = document.createElement("div");
     cont.innerHTML = html;
-    while (cont.firstChild) {
-        document.body.appendChild(cont.firstChild);
-    }
+    while (cont.firstChild) document.body.appendChild(cont.firstChild);
 
     document.getElementById("al-btn-cerrar").addEventListener("click", () => cerrarBannerActual());
     document.getElementById("al-btn-mapa").addEventListener("click", () => verMapaAlerta());
@@ -210,17 +246,13 @@ function asegurarEstructuraDOM() {
 }
 
 async function obtenerModuloMapa() {
-    try {
-        return await import("./map.js");
-    } catch (e) {
-        console.warn("alertas.js: no se pudo importar map.js", e);
-        return null;
-    }
+    try { return await import("./map.js"); }
+    catch (e) { console.warn("alertas.js: no se pudo importar map.js", e); return null; }
 }
 
-// ==========================================================
-// CONTADOR MAESTRO (un único interval para todas las zonas)
-// ==========================================================
+// ----------------------------------------------------------
+// INTERVAL MAESTRO
+// ----------------------------------------------------------
 function iniciarIntervalMaestro() {
     if (estado.intervalMaestro !== null) return;
     estado.intervalMaestro = setInterval(tickMaestro, 1000);
@@ -235,43 +267,61 @@ function detenerIntervalMaestro() {
 }
 
 async function tickMaestro() {
-    const ahora = Date.now();
+    const aQuitar = [];
 
-    // 1. Detectar zonas expiradas
-    const expiradas = [];
     for (const [distrito, zona] of estado.zonasActivas.entries()) {
-        const finMs = zona.timestampInicio + zona.duracionMin * 60 * 1000;
-        if (ahora >= finMs) expiradas.push(distrito);
+        const ef = calcularNivelEfectivo(
+            zona.nivelKey,
+            zona.timestampInicio,
+            zona.duracionMin,
+            zona.origen
+        );
+
+        if (ef.nivel === "libre") {
+            aQuitar.push(distrito);
+            continue;
+        }
+
+        if (ef.nivel !== zona.nivelActual) {
+            const anterior = zona.nivelActual;
+            zona.nivelActual = ef.nivel;
+            console.log(`[alertas] ${distrito}: ${anterior} → ${ef.nivel} (degradación)`);
+
+            if (estado.bannerActual === distrito) {
+                const overlay = document.getElementById("al-overlay");
+                const estabaVisible = overlay?.classList.contains("al-visible");
+                pintarBannerDeZona(zona, { noReabrir: !estabaVisible });
+            }
+        }
     }
 
-    // 2. Quitarlas
-    for (const distrito of expiradas) {
-        try { await quitarAlerta(distrito); } catch (e) { /* log interno */ }
+    for (const distrito of aQuitar) {
+        try { await quitarAlerta(distrito); } catch (e) { console.error(e); }
     }
 
-    // 3. Si ya no quedan zonas → detener el interval
     if (estado.zonasActivas.size === 0) {
         detenerIntervalMaestro();
         return;
     }
 
-    // 4. Actualizar contador visible del banner actual
     if (estado.bannerActual) {
         const zona = estado.zonasActivas.get(estado.bannerActual);
         if (zona) {
-            const finMs = zona.timestampInicio + zona.duracionMin * 60 * 1000;
-            let restante = Math.ceil((finMs - ahora) / 1000);
-            if (restante < 0) restante = 0;
+            const ef = calcularNivelEfectivo(
+                zona.nivelKey,
+                zona.timestampInicio,
+                zona.duracionMin,
+                zona.origen
+            );
             const el = document.getElementById("al-contador");
             if (el) {
-                el.textContent = formatearTiempo(restante);
-                if (restante <= 60) el.classList.add("al-critico");
+                el.textContent = formatearTiempo(ef.restanteSeg);
+                if (ef.restanteSeg <= 60) el.classList.add("al-critico");
                 else el.classList.remove("al-critico");
             }
         }
     }
 
-    // 5. Refrescar barra/tarjeta agregada (tiempos por zona)
     actualizarBarraYTarjetaAgregadas();
 }
 
@@ -284,14 +334,17 @@ function formatearTiempo(segundos) {
 }
 
 function tiempoRestanteZona(zona) {
-    const finMs = zona.timestampInicio + zona.duracionMin * 60 * 1000;
-    const restante = Math.ceil((finMs - Date.now()) / 1000);
-    return restante > 0 ? restante : 0;
+    return calcularNivelEfectivo(
+        zona.nivelKey,
+        zona.timestampInicio,
+        zona.duracionMin,
+        zona.origen
+    ).restanteSeg;
 }
 
-// ==========================================================
+// ----------------------------------------------------------
 // MOSTRAR ALERTA COMPLETA
-// ==========================================================
+// ----------------------------------------------------------
 export async function mostrarAlertaCompleta(datos = {}) {
     try {
         libreYaCerradoPorUsuario = false;
@@ -299,27 +352,30 @@ export async function mostrarAlertaCompleta(datos = {}) {
 
         const nivelKey = NIVELES_ALERTA[datos.nivel] ? datos.nivel : "roja";
         const distrito = datos.distrito || `Zona ${estado.zonasActivas.size + 1}`;
-        const duracionMin = (datos.duracionMin && datos.duracionMin > 0)
-            ? datos.duracionMin : DURACION_TIMER_MINUTOS;
-        const tsInicio = (typeof datos.timestampInicio === "number" && datos.timestampInicio > 0)
-            ? datos.timestampInicio : Date.now();
+        const duracionMin = (datos.duracionMin && datos.duracionMin > 0) ? datos.duracionMin : DURACION_TIMER_MINUTOS;
+        const tsInicio = (typeof datos.timestampInicio === "number" && datos.timestampInicio > 0) ? datos.timestampInicio : Date.now();
 
         const yaExistia = estado.zonasActivas.has(distrito);
 
         estado.zonasActivas.set(distrito, {
-            nivel: nivelKey, nivelKey, distrito,
-            lat: datos.lat ?? null, lng: datos.lng ?? null,
-            duracionMin, timestampInicio: tsInicio,
+            nivel: nivelKey,
+            nivelKey,
+            nivelActual: nivelKey,
+            distrito,
+            lat: datos.lat ?? null,
+            lng: datos.lng ?? null,
+            duracionMin,
+            timestampInicio: tsInicio,
+            origen: datos.origen || null,
             sectorOriginal: datos.sectorOriginal || null,
-            inicio: datos.inicio || null, fin: datos.fin || null,
+            inicio: datos.inicio || null,
+            fin: datos.fin || null,
             titulo: datos.titulo || `⚡ ALERTA ${nivelKey.toUpperCase()} — ${distrito}`,
             mensaje: datos.mensaje || `Actividad eléctrica detectada en ${distrito}.`
         });
 
-        // Arrancar el contador maestro en cuanto haya una zona
         iniciarIntervalMaestro();
 
-        // Pintar polígono del mapa
         if (datos.distrito) {
             const mod = await obtenerModuloMapa();
             if (mod && typeof mod.pintarPoligonoZona === "function") {
@@ -328,7 +384,6 @@ export async function mostrarAlertaCompleta(datos = {}) {
             }
         }
 
-        // Rayo + círculo (solo si es nueva la zona)
         if (!yaExistia && datos.lat != null && datos.lng != null) {
             const mod = await obtenerModuloMapa();
             if (mod && typeof mod.iluminarDistrito === "function") {
@@ -341,27 +396,29 @@ export async function mostrarAlertaCompleta(datos = {}) {
             }
         }
 
-        // Cola de banners
         if (!yaExistia) {
             estado.colaBanners.push(distrito);
             estado.colaBanners.sort((a, b) => {
                 const za = estado.zonasActivas.get(a);
                 const zb = estado.zonasActivas.get(b);
                 if (!za || !zb) return 0;
-                return NIVELES_ALERTA[zb.nivelKey].orden - NIVELES_ALERTA[za.nivelKey].orden;
+                return NIVELES_ALERTA[zb.nivelActual].orden - NIVELES_ALERTA[za.nivelActual].orden;
             });
         }
 
         if (estado.bannerActual === null) {
             mostrarSiguienteBanner();
         } else if (estado.bannerActual === distrito) {
-            pintarBannerDeZona(estado.zonasActivas.get(distrito));
+            const overlay = document.getElementById("al-overlay");
+            const estabaVisible = overlay?.classList.contains("al-visible");
+            pintarBannerDeZona(estado.zonasActivas.get(distrito), { noReabrir: !estabaVisible });
         } else {
             actualizarIndicadorCola();
         }
 
         actualizarBarraYTarjetaAgregadas();
 
+        // Sonido SOLO si es nueva alerta (no en degradaciones)
         if (!yaExistia && nivelKey !== "vigilancia") {
             try { reproducirSonidoAlerta(30); } catch (e) {}
         }
@@ -371,9 +428,9 @@ export async function mostrarAlertaCompleta(datos = {}) {
     }
 }
 
-// ==========================================================
+// ----------------------------------------------------------
 // QUITAR ALERTA
-// ==========================================================
+// ----------------------------------------------------------
 export async function quitarAlerta(distrito) {
     try {
         if (!distrito) return false;
@@ -387,23 +444,19 @@ export async function quitarAlerta(distrito) {
         }
         if (!distritoReal) return false;
 
-        // Polígono
         const mod = await obtenerModuloMapa();
         if (mod && typeof mod.quitarPoligonoZona === "function") {
             mod.quitarPoligonoZona(distritoReal);
         }
 
-        // Rayo
         if (capasRayos.has(distritoReal)) {
             try { capasRayos.get(distritoReal).detener(); } catch (e) {}
             capasRayos.delete(distritoReal);
         }
 
-        // Estado
         estado.zonasActivas.delete(distritoReal);
         estado.colaBanners = estado.colaBanners.filter(d => d !== distritoReal);
 
-        // Si era el banner actual
         if (estado.bannerActual === distritoReal) {
             estado.bannerActual = null;
             cerrarBanner();
@@ -414,37 +467,31 @@ export async function quitarAlerta(distrito) {
             actualizarIndicadorCola();
         }
 
-        // Si ya no quedan zonas → libre de alertas
         if (estado.zonasActivas.size === 0) {
             detenerIntervalMaestro();
             detenerSonidoAlerta();
             mostrarAlertaLibre();
         } else {
-            // Refrescar barra/tarjeta con las zonas restantes
             actualizarBarraYTarjetaAgregadas();
         }
 
         return true;
-
     } catch (e) {
         console.error("alertas.js: error al quitar alerta", e);
         return false;
     }
 }
 
-// ==========================================================
-// COLA DE BANNERS
-// ==========================================================
+// ----------------------------------------------------------
+// COLA BANNERS
+// ----------------------------------------------------------
 function mostrarSiguienteBanner() {
     if (estado.colaBanners.length === 0) {
         estado.bannerActual = null;
         cerrarBanner();
-        if (estado.zonasActivas.size === 0) {
-            mostrarAlertaLibre();
-        }
+        if (estado.zonasActivas.size === 0) mostrarAlertaLibre();
         return;
     }
-
     const distrito = estado.colaBanners.shift();
     const zona = estado.zonasActivas.get(distrito);
     if (!zona) { mostrarSiguienteBanner(); return; }
@@ -457,18 +504,17 @@ function mostrarSiguienteBanner() {
 function actualizarIndicadorCola() {
     const el = document.getElementById("al-cola-indicador");
     if (!el) return;
-    const pendientes = estado.colaBanners.length;
-    if (pendientes === 0) {
-        el.style.display = "none";
-        el.textContent = "";
-        return;
-    }
+    const p = estado.colaBanners.length;
+    if (p === 0) { el.style.display = "none"; el.textContent = ""; return; }
     el.style.display = "block";
-    el.textContent = `+ ${pendientes} zona${pendientes > 1 ? "s" : ""} en alerta`;
+    el.textContent = `+ ${p} zona${p > 1 ? "s" : ""} en alerta`;
 }
 
-function pintarBannerDeZona(zona) {
-    const nivel = NIVELES_ALERTA[zona.nivelKey];
+function pintarBannerDeZona(zona, opts = {}) {
+    const nivelKeyActual = zona.nivelActual || zona.nivelKey;
+    const nivel = NIVELES_ALERTA[nivelKeyActual];
+    if (!nivel) return;
+
     const vars = [
         ["--al-color", nivel.color],
         ["--al-color-dark", nivel.colorDark],
@@ -494,52 +540,43 @@ function pintarBannerDeZona(zona) {
 
     const overlay = document.getElementById("al-overlay");
     overlay.classList.remove("al-libre");
-    overlay.classList.add("al-visible");
+    if (!opts.noReabrir) overlay.classList.add("al-visible");
     panel.classList.add("al-sirena-activa");
 
-    activarFlashFondo();
+    if (!opts.noReabrir) activarFlashFondo();
 
-    // Contador visible: se llena en el primer tick del interval maestro
     const wrap = document.getElementById("al-contador-wrap");
     const el = document.getElementById("al-contador");
     if (wrap) wrap.style.display = "block";
-    if (el) {
-        const restante = tiempoRestanteZona(zona);
-        el.textContent = formatearTiempo(restante);
-    }
+    if (el) el.textContent = formatearTiempo(tiempoRestanteZona(zona));
 
     actualizarTimestampBarra(zona.timestampInicio);
-    setTimeout(() => document.getElementById("al-btn-cerrar")?.focus(), 800);
+    if (!opts.noReabrir) setTimeout(() => document.getElementById("al-btn-cerrar")?.focus(), 800);
 }
 
 function cerrarBannerActual() {
-    // Cerrar el overlay visualmente, pero NO detener el interval maestro.
-    // La zona sigue activa y su contador sigue corriendo.
     cerrarBanner();
     estado.bannerActual = null;
 
-    // Pasar al siguiente banner si hay cola; si no, dejar la barra/tarjeta
     if (estado.colaBanners.length > 0) {
         setTimeout(() => mostrarSiguienteBanner(), 400);
     } else if (estado.zonasActivas.size > 0) {
-        // Actualizar la barra/tarjeta para reflejar zonas activas
         actualizarBarraYTarjetaAgregadas();
     } else {
-        // No quedan zonas → libre
         libreYaCerradoPorUsuario = true;
         mostrarBarraTarjetaLibre();
     }
 }
 
 function cerrarBanner() {
-    const overlay = document.getElementById("al-overlay");
-    overlay?.classList.remove("al-visible");
-    overlay?.classList.remove("al-libre");
+    const o = document.getElementById("al-overlay");
+    o?.classList.remove("al-visible");
+    o?.classList.remove("al-libre");
 }
 
-// ==========================================================
+// ----------------------------------------------------------
 // OVERLAY LIBRE
-// ==========================================================
+// ----------------------------------------------------------
 function abrirOverlayLibre() {
     try {
         asegurarEstructuraDOM();
@@ -549,10 +586,7 @@ function abrirOverlayLibre() {
             ["--al-color-dark", nivel.colorDark],
             ["--al-glow", nivel.glow]
         ];
-        const aplicarVars = (el) => {
-            if (!el) return;
-            vars.forEach(([k, v]) => el.style.setProperty(k, v));
-        };
+        const aplicarVars = (el) => { if (!el) return; vars.forEach(([k, v]) => el.style.setProperty(k, v)); };
         aplicarVars(document.getElementById("al-overlay"));
         aplicarVars(document.getElementById("al-panel"));
         aplicarVars(document.getElementById("al-modal-seguridad"));
@@ -578,15 +612,12 @@ function abrirOverlayLibre() {
 
         const cola = document.getElementById("al-cola-indicador");
         if (cola) cola.style.display = "none";
-
-    } catch (e) {
-        console.error("alertas.js: error al abrir overlay libre", e);
-    }
+    } catch (e) { console.error("alertas.js: error al abrir overlay libre", e); }
 }
 
-// ==========================================================
-// BARRA SUPERIOR Y TARJETA AGREGADAS
-// ==========================================================
+// ----------------------------------------------------------
+// BARRA + TARJETA AGREGADAS
+// ----------------------------------------------------------
 function actualizarBarraYTarjetaAgregadas() {
     const barra = document.getElementById("al-barra-superior");
     const tarjeta = document.getElementById("al-tarjeta");
@@ -597,7 +628,8 @@ function actualizarBarraYTarjetaAgregadas() {
 
     let nivelMax = NIVELES_ALERTA.vigilancia;
     for (const z of zonas) {
-        const n = NIVELES_ALERTA[z.nivelKey];
+        const nivelKeyActual = z.nivelActual || z.nivelKey;
+        const n = NIVELES_ALERTA[nivelKeyActual];
         if (n.orden > nivelMax.orden) nivelMax = n;
     }
 
@@ -606,10 +638,7 @@ function actualizarBarraYTarjetaAgregadas() {
         ["--al-color-dark", nivelMax.colorDark],
         ["--al-glow", nivelMax.glow]
     ];
-    const aplicarVars = (el) => {
-        if (!el) return;
-        vars.forEach(([k, v]) => el.style.setProperty(k, v));
-    };
+    const aplicarVars = (el) => { if (!el) return; vars.forEach(([k, v]) => el.style.setProperty(k, v)); };
     aplicarVars(barra);
     aplicarVars(tarjeta);
 
@@ -620,21 +649,17 @@ function actualizarBarraYTarjetaAgregadas() {
 
     if (zonas.length === 1) {
         const z = zonas[0];
-        const n = NIVELES_ALERTA[z.nivelKey];
-        document.getElementById("al-barra-nivel").textContent =
-            (n.nombre + " " + n.icono).toUpperCase();
-        document.getElementById("al-barra-desc").textContent =
-            `${z.sectorOriginal || z.distrito} · ${z.distrito}`;
+        const n = NIVELES_ALERTA[z.nivelActual || z.nivelKey];
+        document.getElementById("al-barra-nivel").textContent = (n.nombre + " " + n.icono).toUpperCase();
+        document.getElementById("al-barra-desc").textContent = `${z.sectorOriginal || z.distrito} · ${z.distrito}`;
     } else {
-        document.getElementById("al-barra-nivel").textContent =
-            `${zonas.length} ZONAS EN ALERTA`;
+        document.getElementById("al-barra-nivel").textContent = `${zonas.length} ZONAS EN ALERTA`;
         const resumen = zonas.slice()
-            .sort((a, b) => NIVELES_ALERTA[b.nivelKey].orden - NIVELES_ALERTA[a.nivelKey].orden)
+            .sort((a, b) => NIVELES_ALERTA[b.nivelActual || b.nivelKey].orden - NIVELES_ALERTA[a.nivelActual || a.nivelKey].orden)
             .map(z => {
-                const n = NIVELES_ALERTA[z.nivelKey];
+                const n = NIVELES_ALERTA[z.nivelActual || z.nivelKey];
                 return `${n.icono} ${z.distrito}`;
-            })
-            .join(" · ");
+            }).join(" · ");
         document.getElementById("al-barra-desc").textContent = resumen;
     }
     barra.classList.add("al-visible");
@@ -643,36 +668,33 @@ function actualizarBarraYTarjetaAgregadas() {
 
     if (zonas.length === 1) {
         const z = zonas[0];
-        const n = NIVELES_ALERTA[z.nivelKey];
+        const n = NIVELES_ALERTA[z.nivelActual || z.nivelKey];
         document.getElementById("al-tarjeta-sub").textContent = ("ALERTA " + n.nombre).toUpperCase();
         document.getElementById("al-tarjeta-titulo").textContent = z.titulo;
         const cuerpo = [];
         if (z.sectorOriginal) cuerpo.push(`<strong>🏭 Sector:</strong> ${z.sectorOriginal}`);
         if (z.distrito)       cuerpo.push(`<strong>📍 Zona:</strong> ${z.distrito}`);
-        if (z.inicio)         cuerpo.push(`<strong>🕒 Inicio:</strong> ${z.inicio}`);
-        if (z.fin)            cuerpo.push(`<strong>⏹️ Fin previsto:</strong> ${z.fin}`);
-        cuerpo.push(`<strong>⚡ Nivel:</strong> ${n.nombre}`);
+        cuerpo.push(`<strong>⚡ Nivel actual:</strong> ${n.nombre}`);
         cuerpo.push(`<strong>⏰ Restante:</strong> ${formatearTiempo(tiempoRestanteZona(z))}`);
         document.getElementById("al-tarjeta-cuerpo").innerHTML = cuerpo.join("<br>");
     } else {
         document.getElementById("al-tarjeta-sub").textContent = `${zonas.length} ZONAS EN ALERTA`;
         document.getElementById("al-tarjeta-titulo").textContent = "Alerta múltiple";
-        const ordenadas = zonas.slice().sort((a, b) =>
-            NIVELES_ALERTA[b.nivelKey].orden - NIVELES_ALERTA[a.nivelKey].orden
-        );
-        const lineas = ordenadas.map(z => {
-            const n = NIVELES_ALERTA[z.nivelKey];
-            const t = formatearTiempo(tiempoRestanteZona(z));
-            return `${n.icono} <strong>${z.distrito}</strong> — ${n.nombre}<br>⏰ Restante: ${t}`;
-        });
+        const lineas = zonas.slice()
+            .sort((a, b) => NIVELES_ALERTA[b.nivelActual || b.nivelKey].orden - NIVELES_ALERTA[a.nivelActual || a.nivelKey].orden)
+            .map(z => {
+                const n = NIVELES_ALERTA[z.nivelActual || z.nivelKey];
+                const t = formatearTiempo(tiempoRestanteZona(z));
+                return `${n.icono} <strong>${z.distrito}</strong> — ${n.nombre}<br>⏰ Restante: ${t}`;
+            });
         document.getElementById("al-tarjeta-cuerpo").innerHTML = lineas.join("<br><br>");
     }
     tarjeta.classList.add("al-visible");
 }
 
-// ==========================================================
+// ----------------------------------------------------------
 // TIMESTAMP BARRA
-// ==========================================================
+// ----------------------------------------------------------
 function actualizarTimestampBarra(timestampInicio) {
     const el = document.getElementById("al-barra-tiempo");
     if (!el) return;
@@ -690,9 +712,9 @@ function actualizarTimestampBarra(timestampInicio) {
     estado.intervalTimestamp = setInterval(actualizar, 15000);
 }
 
-// ==========================================================
+// ----------------------------------------------------------
 // BARRA + TARJETA LIBRE
-// ==========================================================
+// ----------------------------------------------------------
 export function mostrarBarraTarjetaLibre() {
     try {
         asegurarEstructuraDOM();
@@ -702,10 +724,7 @@ export function mostrarBarraTarjetaLibre() {
             ["--al-color-dark", nivel.colorDark],
             ["--al-glow", nivel.glow]
         ];
-        const aplicarVars = (el) => {
-            if (!el) return;
-            vars.forEach(([k, v]) => el.style.setProperty(k, v));
-        };
+        const aplicarVars = (el) => { if (!el) return; vars.forEach(([k, v]) => el.style.setProperty(k, v)); };
 
         const barra = document.getElementById("al-barra-superior");
         const tarjeta = document.getElementById("al-tarjeta");
@@ -728,21 +747,31 @@ export function mostrarBarraTarjetaLibre() {
             "<strong>🟢 Estado:</strong> Sin alertas meteorológicas<br>" +
             "<strong>📍 Sistema:</strong> En vigilancia";
         tarjeta?.classList.add("al-visible");
-    } catch (e) {
-        console.error("alertas.js: error al mostrar barra/tarjeta libre", e);
-    }
+    } catch (e) { console.error("alertas.js: error al mostrar barra/tarjeta libre", e); }
 }
 
-// ==========================================================
+// ----------------------------------------------------------
 // MOSTRAR LIBRE
-// ==========================================================
+// ----------------------------------------------------------
 export function mostrarAlertaLibre() {
     try {
+        if (window.__estadoClienteIniciando) {
+            console.log("[alertas] posponiendo mostrarAlertaLibre (primera carga pendiente)");
+            setTimeout(() => {
+                if (window.__estadoClienteIniciando) return;
+                if (estado.zonasActivas.size > 0) return;
+                mostrarAlertaLibre();
+            }, 800);
+            return;
+        }
+
         if (libreYaCerradoPorUsuario) {
             asegurarEstructuraDOM();
             mostrarBarraTarjetaLibre();
             return;
         }
+
+        if (estado.zonasActivas.size > 0) return;
 
         asegurarEstructuraDOM();
         detenerIntervalMaestro();
@@ -754,9 +783,7 @@ export function mostrarAlertaLibre() {
         capasRayos.clear();
 
         obtenerModuloMapa().then(mod => {
-            if (mod && typeof mod.limpiarPoligonosZona === "function") {
-                mod.limpiarPoligonosZona();
-            }
+            if (mod && typeof mod.limpiarPoligonosZona === "function") mod.limpiarPoligonosZona();
         }).catch(() => {});
 
         estado.zonasActivas.clear();
@@ -767,19 +794,17 @@ export function mostrarAlertaLibre() {
         mostrarBarraTarjetaLibre();
 
         setTimeout(() => document.getElementById("al-btn-cerrar")?.focus(), 1000);
-    } catch (e) {
-        console.error("alertas.js: error al mostrar alerta libre", e);
-    }
+    } catch (e) { console.error("alertas.js: error al mostrar alerta libre", e); }
 }
 
-// ==========================================================
+// ----------------------------------------------------------
 // BOTONES
-// ==========================================================
+// ----------------------------------------------------------
 function verMapaAlerta() {
     try {
-        const overlay = document.getElementById("al-overlay");
-        overlay?.classList.remove("al-visible");
-        overlay?.classList.remove("al-libre");
+        const o = document.getElementById("al-overlay");
+        o?.classList.remove("al-visible");
+        o?.classList.remove("al-libre");
         setTimeout(() => {
             const mapEl = document.getElementById("map");
             if (mapEl) mapEl.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -789,16 +814,12 @@ function verMapaAlerta() {
 
 function abrirBannerDeNuevo() {
     if (estado.bannerActual) {
-        const overlay = document.getElementById("al-overlay");
-        if (overlay && !overlay.classList.contains("al-visible")) {
-            overlay.classList.add("al-visible");
-            overlay.classList.remove("al-libre");
-            const panel = document.getElementById("al-panel");
-            if (panel) {
-                panel.classList.remove("al-sirena-activa");
-                void panel.offsetWidth;
-                panel.classList.add("al-sirena-activa");
-            }
+        const o = document.getElementById("al-overlay");
+        if (o && !o.classList.contains("al-visible")) {
+            o.classList.add("al-visible");
+            o.classList.remove("al-libre");
+            const p = document.getElementById("al-panel");
+            if (p) { p.classList.remove("al-sirena-activa"); void p.offsetWidth; p.classList.add("al-sirena-activa"); }
         }
         return;
     }
@@ -809,7 +830,7 @@ function abrirBannerDeNuevo() {
             const za = estado.zonasActivas.get(a);
             const zb = estado.zonasActivas.get(b);
             if (!za || !zb) return 0;
-            return NIVELES_ALERTA[zb.nivelKey].orden - NIVELES_ALERTA[za.nivelKey].orden;
+            return NIVELES_ALERTA[zb.nivelActual || zb.nivelKey].orden - NIVELES_ALERTA[za.nivelActual || za.nivelKey].orden;
         });
         mostrarSiguienteBanner();
         return;
@@ -822,21 +843,18 @@ function mostrarModalSeguridad() {
         let nivelKey = "roja";
         if (estado.bannerActual) {
             const z = estado.zonasActivas.get(estado.bannerActual);
-            if (z) nivelKey = z.nivelKey;
+            if (z) nivelKey = z.nivelActual || z.nivelKey;
         } else if (estado.zonasActivas.size > 0) {
             let max = NIVELES_ALERTA.vigilancia;
             for (const z of estado.zonasActivas.values()) {
-                const n = NIVELES_ALERTA[z.nivelKey];
+                const n = NIVELES_ALERTA[z.nivelActual || z.nivelKey];
                 if (n.orden > max.orden) max = n;
             }
             nivelKey = Object.keys(NIVELES_ALERTA).find(k => NIVELES_ALERTA[k] === max) || "roja";
-        } else {
-            nivelKey = "vigilancia";
-        }
-        const nivel = NIVELES_ALERTA[nivelKey];
+        } else nivelKey = "vigilancia";
 
-        document.getElementById("al-modal-sub").textContent =
-            ("NIVEL: " + nivel.nombre).toUpperCase();
+        const nivel = NIVELES_ALERTA[nivelKey];
+        document.getElementById("al-modal-sub").textContent = ("NIVEL: " + nivel.nombre).toUpperCase();
         document.getElementById("al-modal-seguridad").style.setProperty("--al-color", nivel.color);
 
         const leyenda = document.getElementById("al-leyenda");
@@ -862,14 +880,10 @@ function mostrarModalSeguridad() {
         });
 
         document.getElementById("al-modal-seguridad").classList.add("al-visible");
-    } catch (e) {
-        console.error("alertas.js: error modal seguridad", e);
-    }
+    } catch (e) { console.error("alertas.js: error modal seguridad", e); }
 }
 
-function cerrarModalSeguridad() {
-    document.getElementById("al-modal-seguridad")?.classList.remove("al-visible");
-}
+function cerrarModalSeguridad() { document.getElementById("al-modal-seguridad")?.classList.remove("al-visible"); }
 
 function activarFlashFondo() {
     try {
@@ -882,21 +896,18 @@ function activarFlashFondo() {
 }
 
 function ocultarBarraSuperior() {
-    const barra = document.getElementById("al-barra-superior");
-    if (barra?.classList.contains("al-modo-libre")) return;
+    const b = document.getElementById("al-barra-superior");
+    if (b?.classList.contains("al-modo-libre")) return;
     if (estado.zonasActivas.size > 0) return;
-    barra?.classList.remove("al-visible");
-    if (estado.intervalTimestamp) {
-        clearInterval(estado.intervalTimestamp);
-        estado.intervalTimestamp = null;
-    }
+    b?.classList.remove("al-visible");
+    if (estado.intervalTimestamp) { clearInterval(estado.intervalTimestamp); estado.intervalTimestamp = null; }
 }
 
 function ocultarTarjeta() {
-    const tarjeta = document.getElementById("al-tarjeta");
-    if (tarjeta?.classList.contains("al-modo-libre")) return;
+    const t = document.getElementById("al-tarjeta");
+    if (t?.classList.contains("al-modo-libre")) return;
     if (estado.zonasActivas.size > 0) return;
-    tarjeta?.classList.remove("al-visible");
+    t?.classList.remove("al-visible");
 }
 
 export function cerrarAlerta() { cerrarBannerActual(); }
@@ -908,17 +919,13 @@ export function cerrarAlertaTotal() {
     cerrarModalSeguridad();
     detenerIntervalMaestro();
     detenerSonidoAlerta();
-    for (const [, capa] of capasRayos.entries()) {
-        try { capa.detener(); } catch (e) {}
-    }
+    for (const [, capa] of capasRayos.entries()) { try { capa.detener(); } catch (e) {} }
     capasRayos.clear();
     estado.zonasActivas.clear();
     estado.colaBanners = [];
     estado.bannerActual = null;
     obtenerModuloMapa().then(mod => {
-        if (mod && typeof mod.limpiarPoligonosZona === "function") {
-            mod.limpiarPoligonosZona();
-        }
+        if (mod && typeof mod.limpiarPoligonosZona === "function") mod.limpiarPoligonosZona();
     }).catch(() => {});
 }
 
