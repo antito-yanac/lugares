@@ -1,15 +1,9 @@
 // js/estado-cliente.js
 // ============================================================
-// Puente estado.json ↔ sistema de alertas (v4)
-// ------------------------------------------------------------
-// v4 (fix): detecta cuando Keraunos EXTIENDE o ACORTA la duración
-//           de una alerta en curso (cambia `duracionMin`) aunque
-//           el `timestampInicio` y el nivel no cambien. Antes, ese
-//           cambio se ignoraba y el frontend quedaba con los
-//           tiempos viejos.
-//
-// v3 (mantenido): primera carga siempre reconstruye el estado
-//                 del mapa (ignora el historial tras recargar).
+// Puente estado.json ↔ sistema de alertas (v6)
+// v6: pasa `origen` a mostrarAlertaCompleta (viene null del
+//     scraper, por eso NO degrada).
+// v5: flag global para evitar parpadeo verde antes de alerta.
 // ============================================================
 
 import { mostrarAlertaCompleta, mostrarAlertaLibre, quitarAlerta } from "./alertas.js";
@@ -27,7 +21,6 @@ const cliente = {
     cargado: false
 };
 
-// FIX v3: primera carga tras recargar la página
 let primeraCarga = true;
 
 function cargarHistorial() {
@@ -35,13 +28,8 @@ function cargarHistorial() {
         const raw = localStorage.getItem(STORAGE_KEY);
         if (!raw) return { historial: {}, zonas: [] };
         const parsed = JSON.parse(raw);
-        return {
-            historial: parsed.historial || {},
-            zonas: parsed.zonas || []
-        };
-    } catch {
-        return { historial: {}, zonas: [] };
-    }
+        return { historial: parsed.historial || {}, zonas: parsed.zonas || [] };
+    } catch { return { historial: {}, zonas: [] }; }
 }
 
 function guardarHistorial(historial, zonas) {
@@ -60,9 +48,7 @@ function guardarHistorial(historial, zonas) {
     } catch {}
 }
 
-function claveAlerta(a) {
-    return `${a.distrito}::${a.timestampInicio}`;
-}
+function claveAlerta(a) { return `${a.distrito}::${a.timestampInicio}`; }
 
 async function leerEstado() {
     const url = `${ESTADO_URL}?t=${Date.now()}`;
@@ -73,22 +59,22 @@ async function leerEstado() {
 
 async function enviarAlertaFirestore(alerta) {
     const { enviarMensajePush } = await import("./mensajes.js");
-    const datosAlerta = {
-        tipo:            "alerta",
-        nivel:           alerta.nivel,
-        distrito:        alerta.distrito,
-        lat:             alerta.lat,
-        lng:             alerta.lng,
-        duracionMin:     alerta.duracionMin,
-        timestampInicio: alerta.timestampInicio,
-        sectorOriginal:  alerta.sectorOriginal,
-        inicio:          alerta.inicio,
-        fin:             alerta.fin
-    };
     await enviarMensajePush(
         alerta.titulo || `⚡ ALERTA ${alerta.nivel.toUpperCase()} — ${alerta.distrito}`,
         alerta.mensaje || `Actividad eléctrica detectada en ${alerta.distrito}.`,
-        datosAlerta
+        {
+            tipo: "alerta",
+            nivel: alerta.nivel,
+            distrito: alerta.distrito,
+            lat: alerta.lat,
+            lng: alerta.lng,
+            duracionMin: alerta.duracionMin,
+            timestampInicio: alerta.timestampInicio,
+            sectorOriginal: alerta.sectorOriginal,
+            inicio: alerta.inicio,
+            fin: alerta.fin
+            // Sin `origen` → será tratado como no-degradable por defecto.
+        }
     );
 }
 
@@ -107,43 +93,31 @@ async function ciclo() {
         data = await leerEstado();
     } catch (e) {
         console.warn("estado-cliente: no se pudo leer estado.json:", e.message);
+        if (primeraCarga && cliente.modo === "index") {
+            window.__estadoClienteIniciando = false;
+            primeraCarga = false;
+        }
         return;
     }
 
     const alertas = Array.isArray(data.alertas) ? data.alertas : [];
-
     const { historial, zonas } = cargarHistorial();
     const zonasVistas = new Set(zonas);
-
     const distritosActuales = new Set();
 
-    // --------------------------------------------------------
-    // FASE 1 — Detectar alertas NUEVAS o ACTUALIZADAS
-    // Dispara si:
-    //   - primeraCarga (reconstrucción tras recargar)
-    //   - alerta nueva (no está en el historial)
-    //   - cambió el nivel (F3)
-    //   - cambió el timestampInicio (F3, evento nuevo)
-    //   - cambió la duración (FIX v4, Keraunos extendió/acortó)
-    // --------------------------------------------------------
     for (const a of alertas) {
         if (a.nivel !== "amarilla" && a.nivel !== "naranja" && a.nivel !== "roja") continue;
         if (!a.distrito) continue;
-
         distritosActuales.add(a.distrito);
 
         const clave = claveAlerta(a);
         const anterior = historial[clave];
-
-        const cambioNivel     = anterior && anterior.nivel !== a.nivel;
+        const cambioNivel = anterior && anterior.nivel !== a.nivel;
         const cambioTimestamp = anterior && anterior.timestampInicio !== a.timestampInicio;
-        const cambioDuracion  = anterior && anterior.duracionMin !== a.duracionMin;
-
+        const cambioDuracion = anterior && anterior.duracionMin !== a.duracionMin;
         const esNueva = primeraCarga || !anterior || cambioNivel || cambioTimestamp || cambioDuracion;
 
         if (esNueva) {
-            // Registrar el estado actual (incluye duracionMin para
-            // poder detectar extensiones de la alerta)
             historial[clave] = {
                 nivel: a.nivel,
                 timestampInicio: a.timestampInicio,
@@ -152,64 +126,44 @@ async function ciclo() {
             };
             zonasVistas.add(a.distrito);
 
-            if (cambioDuracion) {
-                console.log(
-                    `[estado-cliente] duración cambiada en ${a.distrito}: ` +
-                    `${anterior.duracionMin} → ${a.duracionMin} min`
-                );
-            }
-
             if (cliente.modo === "admin") {
                 try {
                     await enviarAlertaFirestore(a);
                     try {
                         const { mostrarToast } = await import("./notifications.js");
-                        mostrarToast(
-                            "🤖 Alerta automática enviada",
-                            `${a.distrito} · ${a.nivel.toUpperCase()}`,
-                            "exito",
-                            false
-                        );
+                        mostrarToast("🤖 Alerta automática enviada",
+                            `${a.distrito} · ${a.nivel.toUpperCase()}`, "exito", false);
                     } catch {}
-                } catch (e) {
-                    console.error("estado-cliente: error enviando a Firestore:", e);
-                }
+                } catch (e) { console.error("estado-cliente: error Firestore:", e); }
             } else if (cliente.modo === "index") {
                 try {
                     await mostrarAlertaCompleta({
-                        tipo:            "alerta",
-                        nivel:           a.nivel,
-                        titulo:          a.titulo,
-                        mensaje:         a.mensaje,
-                        distrito:        a.distrito,
-                        lat:             a.lat,
-                        lng:             a.lng,
-                        duracionMin:     a.duracionMin,
+                        tipo: "alerta",
+                        nivel: a.nivel,
+                        titulo: a.titulo,
+                        mensaje: a.mensaje,
+                        distrito: a.distrito,
+                        lat: a.lat,
+                        lng: a.lng,
+                        duracionMin: a.duracionMin,
                         timestampInicio: a.timestampInicio,
-                        sectorOriginal:  a.sectorOriginal,
-                        inicio:          a.inicio,
-                        fin:             a.fin
+                        sectorOriginal: a.sectorOriginal,
+                        inicio: a.inicio,
+                        fin: a.fin,
+                        origen: a.origen || null
                     });
-                } catch (e) {
-                    console.error("estado-cliente: error mostrando alerta:", e);
-                }
+                } catch (e) { console.error("estado-cliente: error mostrando alerta:", e); }
             }
         }
     }
 
-    // --------------------------------------------------------
-    // FASE 2 — Detectar alertas RESUELTAS
-    // --------------------------------------------------------
     const distritosResueltos = [];
-    for (const distritoAnterior of zonasVistas) {
-        if (!distritosActuales.has(distritoAnterior)) {
-            distritosResueltos.push(distritoAnterior);
-        }
+    for (const d of zonasVistas) {
+        if (!distritosActuales.has(d)) distritosResueltos.push(d);
     }
 
     for (const distrito of distritosResueltos) {
         zonasVistas.delete(distrito);
-
         if (cliente.modo === "admin") {
             try {
                 await enviarResolucionFirestore(distrito);
@@ -217,21 +171,13 @@ async function ciclo() {
                     const { mostrarToast } = await import("./notifications.js");
                     mostrarToast("✅ Alerta finalizada", distrito, "info", false);
                 } catch {}
-            } catch (e) {
-                console.error("estado-cliente: error enviando resolución:", e);
-            }
+            } catch (e) { console.error("estado-cliente: error resolución:", e); }
         } else if (cliente.modo === "index") {
-            try {
-                await quitarAlerta(distrito);
-            } catch (e) {
-                console.error("estado-cliente: error quitando alerta:", e);
-            }
+            try { await quitarAlerta(distrito); }
+            catch (e) { console.error("estado-cliente: error quitando:", e); }
         }
     }
 
-    // --------------------------------------------------------
-    // FASE 3 — Si no hay ninguna zona activa, mostrar libre
-    // --------------------------------------------------------
     if (cliente.modo === "index" &&
         distritosActuales.size === 0 &&
         zonasVistas.size === 0 &&
@@ -240,8 +186,12 @@ async function ciclo() {
         cliente.cargado = true;
     }
 
-    // FIX v3: marcar primera carga como completada
-    if (primeraCarga) primeraCarga = false;
+    if (primeraCarga) {
+        primeraCarga = false;
+        if (cliente.modo === "index") {
+            window.__estadoClienteIniciando = false;
+        }
+    }
 
     guardarHistorial(historial, zonasVistas);
 }
@@ -252,8 +202,10 @@ export function iniciarEstadoCliente(opciones = {}) {
     cliente.modo = opciones.modo || "index";
     console.log(`estado-cliente: iniciado en modo "${cliente.modo}" (${INTERVALO_MS / 1000}s)`);
 
-    // FIX v3: forzar primera carga
     primeraCarga = true;
+    if (cliente.modo === "index") {
+        window.__estadoClienteIniciando = true;
+    }
 
     ciclo();
     cliente.intervaloId = setInterval(ciclo, INTERVALO_MS);
