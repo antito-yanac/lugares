@@ -2,35 +2,32 @@
 //
 // Panel de Alertas — Antamina
 // ============================================================
-// v5 (2026): oculta Zona 4 - Tajo del panel manual.
-//   - El scraper de Keraunos sigue funcionando con las 4 zonas.
-//   - index.html sigue mostrando alertas de Tajo si el scraper
-//     las detecta.
-//   - Solo el operador no puede crear alertas manuales de Tajo.
-//   - Reactivable con 1 palabra: oculta: true → oculta: false.
+// v6 (2026-10):
+//   - Alertas manuales llevan origen: "manual" para que degraden.
+//   - Zona 4 - Tajo oculta (reactivable con flag).
+//   - Sección "Alertas Activas" muestra el nivel EFECTIVO
+//     (degradado) y su contador correspondiente.
+//   - Resto igual.
 // ============================================================
 
 import { inicializarFirebase, mostrarToast } from "./notifications.js";
 import { enviarMensajePush, escucharMensajesPush } from "./mensajes.js";
 import { iniciarSesion, cerrarSesion, observarSesion, traducirErrorAuth } from "./auth.js";
-import { NIVELES_ALERTA } from "./alertas.js";
+import { NIVELES_ALERTA, calcularNivelEfectivo } from "./alertas.js";
 import { iniciarEstadoCliente } from "./estado-cliente.js";
 import { getFirestore, collection, query, orderBy, limit, onSnapshot }
     from "https://www.gstatic.com/firebasejs/12.17.0/firebase-firestore.js";
 import { obtenerApp } from "./firebase-app.js";
 
 // ======================================================
-// ZONAS OFICIALES (fuente única)
+// ZONAS OFICIALES
 // ======================================================
-// - `oculta: true`  → no se muestra en el panel manual.
-// - El scraper sigue enviando alertas de TODAS las zonas.
 const ZONAS = [
     { distrito: "Zona 1 - Campamentos",   sectorOriginal: "Campamento Yanacancha", lat: -9.5822364, lng: -77.0223100, short: "1", oculta: false },
     { distrito: "Zona 2 - Botadero Este", sectorOriginal: "Oficinas Mina",         lat: -9.5718388, lng: -77.0447182, short: "2", oculta: false },
     { distrito: "Zona 3 - Tucush",        sectorOriginal: "Tucush",                lat: -9.5263487, lng: -77.0485794, short: "3", oculta: false },
-    // ⚠️ ZONA 4 OCULTA: no se muestra en el panel manual.
-    // Para reactivarla: cambiar oculta: true → oculta: false.
-    // El scraper de Keraunos sigue funcionando con las 4 zonas.
+    // ⚠️ Zona 4 oculta del panel manual. Para reactivarla:
+    //     cambiar `oculta: true` → `oculta: false`.
     { distrito: "Zona 4 - Tajo",          sectorOriginal: "Tajo",                  lat: -9.5416465, lng: -77.0707659, short: "4", oculta: true  }
 ];
 
@@ -65,7 +62,6 @@ const charCounter = document.getElementById("char-counter");
 
 const statusBar = document.getElementById("status-bar");
 
-// Modal
 const modalConfirm = document.getElementById("modal-confirm");
 const modalBox = document.getElementById("modal-box");
 const modalIcon = document.getElementById("modal-icon");
@@ -86,7 +82,6 @@ const estado = {
     panelListo: false
 };
 
-// Inicializar config por zona
 ZONAS.forEach(z => {
     estado.config[z.distrito] = {
         activa: false,
@@ -198,12 +193,10 @@ async function initPanel() {
         catch (e) { console.warn("estado-cliente (admin):", e); }
 
         escucharAlertasActivas();
-
         if (estado.intervalContadores) clearInterval(estado.intervalContadores);
         estado.intervalContadores = setInterval(actualizarContadores, 1000);
 
         estado.panelListo = true;
-
     } catch (error) {
         console.error("Error iniciando panel:", error);
         mostrarEstado("Panel listo (sin Firebase).", "");
@@ -211,13 +204,12 @@ async function initPanel() {
 }
 
 // ======================================================
-// Render de las tarjetas de sector (solo las visibles)
+// Render de las tarjetas de sector
 // ======================================================
 function renderSectores() {
     paNaLista.innerHTML = "";
 
     ZONAS.forEach(z => {
-        // Saltar zonas marcadas como ocultas (no se muestran en el panel)
         if (z.oculta) return;
 
         const cfg = estado.config[z.distrito];
@@ -251,22 +243,18 @@ function renderSectores() {
 }
 
 // ======================================================
-// Enganchar eventos (delegación)
+// Enganchar eventos
 // ======================================================
 function engancharEventos() {
     paNaLista.addEventListener("click", (e) => {
         const checkBtn = e.target.closest(".pa-na-check");
         if (checkBtn) {
-            const distrito = checkBtn.dataset.distrito;
-            toggleZona(distrito);
+            toggleZona(checkBtn.dataset.distrito);
             return;
         }
-
         const pill = e.target.closest(".pa-pill");
         if (pill) {
-            const distrito = pill.dataset.distrito;
-            const nivel = pill.dataset.nivel;
-            seleccionarNivel(distrito, nivel);
+            seleccionarNivel(pill.dataset.distrito, pill.dataset.nivel);
             return;
         }
     });
@@ -309,11 +297,14 @@ function engancharEventos() {
 }
 
 // ======================================================
-// Toggle de zona
+// Toggle / nivel
 // ======================================================
 function toggleZona(distrito) {
     const cfg = estado.config[distrito];
     if (!cfg) return;
+    const zona = ZONAS.find(z => z.distrito === distrito);
+    if (zona && zona.oculta) return;
+
     cfg.activa = !cfg.activa;
     marcarUltimaTocada(distrito);
     aplicarEstadoVisual();
@@ -324,6 +315,9 @@ function seleccionarNivel(distrito, nivel) {
     if (!NIVELES_VALIDOS.includes(nivel)) return;
     const cfg = estado.config[distrito];
     if (!cfg) return;
+    const zona = ZONAS.find(z => z.distrito === distrito);
+    if (zona && zona.oculta) return;
+
     cfg.nivel = nivel;
     if (!cfg.activa) cfg.activa = true;
     marcarUltimaTocada(distrito);
@@ -339,12 +333,11 @@ function marcarUltimaTocada(distrito) {
 }
 
 // ======================================================
-// Aplicar estado visual a las tarjetas
+// Aplicar estado visual
 // ======================================================
 function aplicarEstadoVisual() {
     ZONAS.forEach(z => {
         if (z.oculta) return;
-
         const cfg = estado.config[z.distrito];
         const card = document.querySelector(`.pa-na-card[data-distrito="${cssEscape(z.distrito)}"]`);
         if (!card) return;
@@ -357,9 +350,7 @@ function aplicarEstadoVisual() {
         else check.classList.remove("pa-on");
 
         card.classList.remove("pa-activa-amarilla", "pa-activa-naranja", "pa-activa-roja");
-        if (cfg.activa) {
-            card.classList.add(`pa-activa-${cfg.nivel}`);
-        }
+        if (cfg.activa) card.classList.add(`pa-activa-${cfg.nivel}`);
 
         card.querySelectorAll(".pa-pill").forEach(p => {
             p.classList.remove("pa-sel-amarilla", "pa-sel-naranja", "pa-sel-roja");
@@ -378,7 +369,7 @@ function aplicarEstadoVisual() {
 }
 
 // ======================================================
-// Resumen antes de enviar
+// Resumen
 // ======================================================
 function actualizarResumen() {
     const activas = zonasSeleccionadas();
@@ -408,7 +399,7 @@ function actualizarResumen() {
 function zonasSeleccionadas() {
     const out = [];
     for (const z of ZONAS) {
-        if (z.oculta) continue;   // ← zonas ocultas nunca se envían
+        if (z.oculta) continue;
         const cfg = estado.config[z.distrito];
         if (cfg.activa) {
             out.push({
@@ -425,7 +416,7 @@ function zonasSeleccionadas() {
 }
 
 // ======================================================
-// Click en Enviar
+// Click Enviar
 // ======================================================
 function onClickEnviar() {
     const activas = zonasSeleccionadas();
@@ -451,7 +442,7 @@ function onClickEnviar() {
 }
 
 // ======================================================
-// Enviar alertas (una por zona)
+// Enviar alertas
 // ======================================================
 async function enviarAlertas(activas) {
     paBtnEnviar.disabled = true;
@@ -475,7 +466,8 @@ async function enviarAlertas(activas) {
                     lng: a.lng,
                     duracionMin: a.duracionMin,
                     timestampInicio: Date.now(),
-                    sectorOriginal: a.sectorOriginal
+                    sectorOriginal: a.sectorOriginal,
+                    origen: "manual"
                 };
 
                 await enviarMensajePush(
@@ -510,16 +502,10 @@ async function enviarAlertas(activas) {
         if (okMsg) partes.push("✅ mensaje");
 
         const exito = err === 0;
-        mostrarToast(
-            exito ? "✅ Enviado" : "⚠️ Envío parcial",
-            partes.join(" · "),
-            exito ? "exito" : "alerta",
-            true
-        );
+        mostrarToast(exito ? "✅ Enviado" : "⚠️ Envío parcial", partes.join(" · "), exito ? "exito" : "alerta", true);
         mostrarEstado(partes.join(" · "), exito ? "success" : "error");
 
         if (ok > 0 || okMsg) limpiarFormulario();
-
     } catch (e) {
         console.error("Error general:", e);
         mostrarToast("❌ Error", "Revisa la consola (F12).", "alerta", true);
@@ -530,11 +516,10 @@ async function enviarAlertas(activas) {
 }
 
 // ======================================================
-// Limpiar formulario tras envío exitoso
+// Limpiar formulario
 // ======================================================
 function limpiarFormulario() {
     ZONAS.forEach(z => {
-        if (z.oculta) return;
         estado.config[z.distrito] = {
             activa: false,
             nivel: "amarilla",
@@ -556,7 +541,7 @@ function limpiarFormulario() {
 }
 
 // ======================================================
-// Listener: alertas activas en Firestore
+// Listener Firestore
 // ======================================================
 function escucharAlertasActivas() {
     try {
@@ -589,7 +574,8 @@ function escucharAlertasActivas() {
                             nivel: data.nivel || "roja",
                             timestampInicio: tsIni,
                             duracionMin: dur,
-                            docId: id
+                            docId: id,
+                            origen: data.origen || null
                         });
                     } else {
                         estadoPorDistrito.set(distrito, { resuelta: true });
@@ -608,14 +594,13 @@ function escucharAlertasActivas() {
         }, (err) => {
             console.warn("listener alertas activas:", err);
         });
-
     } catch (e) {
         console.warn("No se pudo iniciar listener de alertas:", e);
     }
 }
 
 // ======================================================
-// Render de la sección "Alertas activas"
+// Render "Alertas activas" (con nivel efectivo)
 // ======================================================
 function renderAlertasActivas() {
     const count = estado.alertasActivas.size;
@@ -629,14 +614,28 @@ function renderAlertasActivas() {
     paAACount.textContent = `(${count})`;
     paAALista.innerHTML = "";
 
-    const orden = { roja: 3, naranja: 2, amarilla: 1 };
-    const items = Array.from(estado.alertasActivas.entries())
-        .sort((a, b) => (orden[b[1].nivel] || 0) - (orden[a[1].nivel] || 0));
+    const items = [];
+    for (const [distrito, info] of estado.alertasActivas.entries()) {
+        const ef = calcularNivelEfectivo(info.nivel, info.timestampInicio, info.duracionMin, info.origen);
+        if (ef.nivel === "libre") continue;
+        items.push({ distrito, info, ef });
+    }
 
-    for (const [distrito, info] of items) {
-        const n = NIVELES_ALERTA[info.nivel] || NIVELES_ALERTA.roja;
+    if (items.length === 0) {
+        paAASection.style.display = "none";
+        return;
+    }
+
+    paAACount.textContent = `(${items.length})`;
+
+    items.sort((a, b) =>
+        (NIVELES_ALERTA[b.ef.nivel]?.orden || 0) - (NIVELES_ALERTA[a.ef.nivel]?.orden || 0)
+    );
+
+    for (const { distrito, info, ef } of items) {
+        const n = NIVELES_ALERTA[ef.nivel] || NIVELES_ALERTA.roja;
         const item = document.createElement("div");
-        item.className = `pa-aa-item pa-nivel-${info.nivel}`;
+        item.className = `pa-aa-item pa-nivel-${ef.nivel}`;
         item.dataset.distrito = distrito;
         item.innerHTML = `
             <div class="pa-aa-icono">${n.icono}</div>
@@ -659,28 +658,33 @@ function renderAlertasActivas() {
         btn.addEventListener("click", () => onClickLiberarZona(btn.dataset.distrito));
     });
 
-    if (count >= 1) {
-        paBtnLiberarTodas.style.display = "";
-    } else {
-        paBtnLiberarTodas.style.display = "none";
-    }
-
+    paBtnLiberarTodas.style.display = items.length >= 1 ? "" : "none";
     actualizarContadores();
 }
 
 // ======================================================
-// Contadores en vivo (cada segundo)
+// Contadores en vivo
 // ======================================================
 function actualizarContadores() {
-    const ahora = Date.now();
     for (const [distrito, info] of estado.alertasActivas.entries()) {
         const el = paAALista.querySelector(`.pa-aa-restante[data-distrito="${cssEscape(distrito)}"]`);
         if (!el) continue;
 
-        const finMs = info.timestampInicio + info.duracionMin * 60 * 1000;
-        let restante = Math.ceil((finMs - ahora) / 1000);
-        if (restante < 0) restante = 0;
+        const ef = calcularNivelEfectivo(info.nivel, info.timestampInicio, info.duracionMin, info.origen);
 
+        if (ef.nivel === "libre") {
+            estado.alertasActivas.delete(distrito);
+            el.closest(".pa-aa-item")?.remove();
+            continue;
+        }
+
+        const itemEl = el.closest(".pa-aa-item");
+        if (itemEl && !itemEl.classList.contains(`pa-nivel-${ef.nivel}`)) {
+            renderAlertasActivas();
+            return;
+        }
+
+        const restante = ef.restanteSeg;
         const h = Math.floor(restante / 3600);
         const m = Math.floor((restante % 3600) / 60);
         const s = restante % 60;
@@ -689,21 +693,23 @@ function actualizarContadores() {
         if (restante <= 60) el.classList.add("pa-critico");
         else el.classList.remove("pa-critico");
     }
+
+    if (estado.alertasActivas.size === 0) {
+        paAASection.style.display = "none";
+    }
 }
 
 // ======================================================
-// Liberar una zona
+// Liberar
 // ======================================================
 function onClickLiberarZona(distrito) {
     const info = estado.alertasActivas.get(distrito);
     if (!info) return;
 
-    const n = NIVELES_ALERTA[info.nivel] || NIVELES_ALERTA.roja;
-    const finMs = info.timestampInicio + info.duracionMin * 60 * 1000;
-    let restante = Math.ceil((finMs - Date.now()) / 1000);
-    if (restante < 0) restante = 0;
-    const mm = Math.floor(restante / 60);
-    const ss = restante % 60;
+    const ef = calcularNivelEfectivo(info.nivel, info.timestampInicio, info.duracionMin, info.origen);
+    const n = NIVELES_ALERTA[ef.nivel] || NIVELES_ALERTA.roja;
+    const mm = Math.floor(ef.restanteSeg / 60);
+    const ss = ef.restanteSeg % 60;
 
     abrirModal({
         icon: "🛑",
@@ -736,9 +742,6 @@ async function liberarZona(distrito) {
     }
 }
 
-// ======================================================
-// Liberar TODAS
-// ======================================================
 function onClickLiberarTodas() {
     const zonas = Array.from(estado.alertasActivas.keys());
     if (zonas.length === 0) return;
@@ -806,7 +809,6 @@ function onKeyDown(e) {
     if (esInput) return;
     if (modalConfirm.classList.contains("modal-visible")) return;
 
-    // 1, 2, 3, 4 → toggle zona (solo si la zona NO está oculta)
     if (["1", "2", "3", "4"].includes(e.key)) {
         e.preventDefault();
         const zona = ZONAS.find(z => z.short === e.key);
@@ -818,15 +820,12 @@ function onKeyDown(e) {
         const k = e.key.toUpperCase();
         if (k === "A" || k === "N" || k === "R") {
             if (!estado.ultimaZonaTocada) {
-                mostrarToast("⚠️ Sin zona", "Primero selecciona una zona con 1, 2, 3 o 4.", "alerta", false);
+                mostrarToast("⚠️ Sin zona", "Primero selecciona una zona con 1, 2 o 3.", "alerta", false);
                 return;
             }
-            // Validar que la última zona tocada no esté oculta
-            const zonaTocada = ZONAS.find(z => z.distrito === estado.ultimaZonaTocada);
-            if (zonaTocada && zonaTocada.oculta) {
-                mostrarToast("⚠️ Zona no disponible", "Esa zona está deshabilitada.", "alerta", false);
-                return;
-            }
+            const zona = ZONAS.find(z => z.distrito === estado.ultimaZonaTocada);
+            if (zona && zona.oculta) return;
+
             const nivel = k === "A" ? "amarilla" : k === "N" ? "naranja" : "roja";
             e.preventDefault();
             seleccionarNivel(estado.ultimaZonaTocada, nivel);
