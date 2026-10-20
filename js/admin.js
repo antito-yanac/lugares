@@ -2,12 +2,13 @@
 //
 // Panel de Alertas — Antamina
 // ============================================================
-// v6 (2026-10):
-//   - Alertas manuales llevan origen: "manual" para que degraden.
+// v7 (2026-10):
+//   - Modo manual vs automático (flag en sistema/estado_modo).
+//   - Alertas manuales llevan origen: "manual" y degradan.
 //   - Zona 4 - Tajo oculta (reactivable con flag).
-//   - Sección "Alertas Activas" muestra el nivel EFECTIVO
-//     (degradado) y su contador correspondiente.
-//   - Resto igual.
+//   - Alertas Activas muestran nivel EFECTIVO (degradado).
+//   - Recalcula modo cada 15s. Vuelve a automático al expirar
+//     la última zona manual o al liberar todas.
 // ============================================================
 
 import { inicializarFirebase, mostrarToast } from "./notifications.js";
@@ -15,7 +16,8 @@ import { enviarMensajePush, escucharMensajesPush } from "./mensajes.js";
 import { iniciarSesion, cerrarSesion, observarSesion, traducirErrorAuth } from "./auth.js";
 import { NIVELES_ALERTA, calcularNivelEfectivo } from "./alertas.js";
 import { iniciarEstadoCliente } from "./estado-cliente.js";
-import { getFirestore, collection, query, orderBy, limit, onSnapshot }
+import { getFirestore, collection, query, orderBy, limit, onSnapshot,
+         doc, setDoc, serverTimestamp }
     from "https://www.gstatic.com/firebasejs/12.17.0/firebase-firestore.js";
 import { obtenerApp } from "./firebase-app.js";
 
@@ -32,6 +34,13 @@ const ZONAS = [
 ];
 
 const NIVELES_VALIDOS = ["amarilla", "naranja", "roja"];
+
+// ======================================================
+// Modo manual (flag Firestore)
+// ======================================================
+const COLECCION_SISTEMA = "sistema";
+const DOC_MODO = "estado_modo";
+const TIMEOUT_MODO_MS = 8 * 60 * 60 * 1000;   // 8 horas
 
 // ======================================================
 // Referencias DOM
@@ -78,7 +87,8 @@ const estado = {
     ultimaZonaTocada: null,
     alertasActivas: new Map(),
     intervalContadores: null,
-    intervalFirestore: null,
+    intervalModo: null,
+    _ultimoRecalculoModo: 0,
     panelListo: false
 };
 
@@ -189,12 +199,17 @@ async function initPanel() {
 
         mostrarEstado("Panel listo. Configura las alertas y envía.", "");
 
-        try { iniciarEstadoCliente({ modo: "admin" }); }
-        catch (e) { console.warn("estado-cliente (admin):", e); }
+        //try { iniciarEstadoCliente({ modo: "admin" }); }
+        //catch (e) { console.warn("estado-cliente (admin):", e); }
+        console.log("[admin] scraper NO se reenvía a Firestore (vive en keraunos.html)");
 
         escucharAlertasActivas();
+
         if (estado.intervalContadores) clearInterval(estado.intervalContadores);
         estado.intervalContadores = setInterval(actualizarContadores, 1000);
+
+        if (estado.intervalModo) clearInterval(estado.intervalModo);
+        estado.intervalModo = setInterval(actualizarBadgeModo, 2000);
 
         estado.panelListo = true;
     } catch (error) {
@@ -248,15 +263,9 @@ function renderSectores() {
 function engancharEventos() {
     paNaLista.addEventListener("click", (e) => {
         const checkBtn = e.target.closest(".pa-na-check");
-        if (checkBtn) {
-            toggleZona(checkBtn.dataset.distrito);
-            return;
-        }
+        if (checkBtn) { toggleZona(checkBtn.dataset.distrito); return; }
         const pill = e.target.closest(".pa-pill");
-        if (pill) {
-            seleccionarNivel(pill.dataset.distrito, pill.dataset.nivel);
-            return;
-        }
+        if (pill) { seleccionarNivel(pill.dataset.distrito, pill.dataset.nivel); return; }
     });
 
     paNaLista.addEventListener("input", (e) => {
@@ -482,6 +491,12 @@ async function enviarAlertas(activas) {
             }
         }
 
+        // Activar modo manual si se envió al menos 1 alerta
+        if (ok > 0) {
+            const zonasEnviadas = activas.map(a => a.distrito);
+            await escribirModoManual(zonasEnviadas);
+        }
+
         let okMsg = false;
         if (incluirMensaje) {
             if (!tituloMsg || !cuerpoMsg) {
@@ -600,7 +615,7 @@ function escucharAlertasActivas() {
 }
 
 // ======================================================
-// Render "Alertas activas" (con nivel efectivo)
+// Render "Alertas activas"
 // ======================================================
 function renderAlertasActivas() {
     const count = estado.alertasActivas.size;
@@ -697,6 +712,12 @@ function actualizarContadores() {
     if (estado.alertasActivas.size === 0) {
         paAASection.style.display = "none";
     }
+
+    // Recalcular modo cada 15 s
+    if (!estado._ultimoRecalculoModo || (Date.now() - estado._ultimoRecalculoModo) > 15000) {
+        estado._ultimoRecalculoModo = Date.now();
+        recalcularModo().catch(e => console.warn("recalcularModo:", e));
+    }
 }
 
 // ======================================================
@@ -736,6 +757,7 @@ async function liberarZona(distrito) {
         );
         mostrarToast("🛑 Liberada", `${distrito} liberada.`, "info", true);
         mostrarEstado(`✓ ${distrito} liberada.`, "success");
+        setTimeout(() => recalcularModo().catch(() => {}), 1000);
     } catch (e) {
         console.error("Error liberando zona:", e);
         mostrarToast("❌ Error", "No se pudo liberar la zona.", "alerta", true);
@@ -780,11 +802,87 @@ async function liberarTodas(zonas) {
             err++;
         }
     }
+
+    if (ok > 0) {
+        await escribirModoAutomatico();
+    }
+
     const msg = err === 0
         ? `🛑 ${ok} zona${ok > 1 ? "s" : ""} liberada${ok > 1 ? "s" : ""}`
         : `⚠️ ${ok} ok · ${err} fallo${err > 1 ? "s" : ""}`;
     mostrarToast("Liberación", msg, err === 0 ? "info" : "alerta", true);
     mostrarEstado(msg, err === 0 ? "success" : "error");
+}
+
+// ======================================================
+// Modo manual / automático
+// ======================================================
+async function escribirModoManual(zonasActivas) {
+    try {
+        const db = getFirestore(obtenerApp());
+        const ref = doc(db, COLECCION_SISTEMA, DOC_MODO);
+        await setDoc(ref, {
+            modo: "manual",
+            zonasActivas: zonasActivas || [],
+            actualizado: serverTimestamp(),
+            expiraEn: new Date(Date.now() + TIMEOUT_MODO_MS)
+        }, { merge: true });
+        console.log("[admin] modo manual activado:", zonasActivas);
+    } catch (e) {
+        console.error("[admin] error escribiendo modo manual:", e);
+    }
+}
+
+async function escribirModoAutomatico() {
+    try {
+        const db = getFirestore(obtenerApp());
+        const ref = doc(db, COLECCION_SISTEMA, DOC_MODO);
+        await setDoc(ref, {
+            modo: "automatico",
+            zonasActivas: [],
+            actualizado: serverTimestamp(),
+            expiraEn: null
+        }, { merge: true });
+        console.log("[admin] modo automatico activado");
+    } catch (e) {
+        console.error("[admin] error escribiendo modo automatico:", e);
+    }
+}
+
+async function recalcularModo() {
+    const zonasManualesActivas = [];
+    for (const [distrito, info] of estado.alertasActivas.entries()) {
+        if (info.origen === "manual") {
+            const ef = calcularNivelEfectivo(info.nivel, info.timestampInicio, info.duracionMin, info.origen);
+            if (ef.nivel !== "libre") zonasManualesActivas.push(distrito);
+        }
+    }
+
+    if (zonasManualesActivas.length === 0) {
+        await escribirModoAutomatico();
+    } else {
+        await escribirModoManual(zonasManualesActivas);
+    }
+}
+
+// ======================================================
+// Badge del modo (si existe en admin.html)
+// ======================================================
+let _ultimoModoMostrado = null;
+function actualizarBadgeModo() {
+    const el = document.getElementById("pa-badge-modo");
+    if (!el) return;
+
+    // Leer el estado del módulo mensajes.js
+    import("./mensajes.js").then(mod => {
+        const em = mod.estadoModo;
+        if (!em) return;
+        const texto = em.modo === "manual" ? "🖐️ MODO MANUAL" : "🤖 MODO AUTOMÁTICO";
+        if (texto === _ultimoModoMostrado) return;
+        _ultimoModoMostrado = texto;
+        el.textContent = texto;
+        el.style.background = em.modo === "manual" ? "#e67e22" : "#2ecc71";
+    }).catch(() => {});
 }
 
 // ======================================================

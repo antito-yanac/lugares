@@ -7,7 +7,7 @@
 <meta name="viewport"
       content="width=device-width, initial-scale=1, viewport-fit=cover">
 
-<title>Antamina · Vigilancia</title>
+<title>Antamina · SARA</title>
 
 <link rel="stylesheet" href="style.css">
 
@@ -18,6 +18,12 @@ href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 
 <link rel="stylesheet" href="css/alerts.css">
 <link rel="stylesheet" href="css/panico.css">
+
+<link rel="icon" type="image/png" href="./favicon-96x96.png" sizes="96x96">
+<link rel="icon" type="image/svg+xml" href="./favicon.svg">
+<link rel="shortcut icon" href="./favicon.ico">
+<link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png">
+<link rel="manifest" href="./site.webmanifest">
       
 </head>
 
@@ -67,7 +73,7 @@ href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
                     </div>
 
                     <div class="brand-subtitle">
-                        Mapa de lugares
+                        Strike Guard
                     </div>
                 </div>
 
@@ -197,8 +203,55 @@ href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <!-- =========================================================
      MÓDULO PRINCIPAL (al final, cuando todo lo demás existe)
      ========================================================= -->
+<!-- Configuración de la página (debe cargarse ANTES que app.js) -->
+<script src="./js/index-config.js"></script>
+
 <script type="module" src="js/app.js"></script>
+<!-- Botón de Pánico (SOS) -->
 <script type="module" src="js/panico.js"></script>
+<!-- Botón Consultar Keraunos (abajo-izquierda) -->
+<a href="./keraunos.html" id="btn-consultar-keraunos" title="Consultar Keraunos">
+    🛰️ Consultar Keraunos
+</a>
+
+<style>
+    #btn-consultar-keraunos {
+        position: fixed;
+        bottom: calc(27px + 5px + env(safe-area-inset-bottom, 0px));
+        left: 10px;
+        z-index: 2000;
+
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 12px;
+
+        background: rgba(255, 255, 255, 0.95);
+        border: 1.5px solid #193344;
+        border-radius: 10px;
+        color: #193344;
+        font-family: 'Segoe UI', system-ui, sans-serif;
+        font-size: 12px;
+        font-weight: 700;
+        text-decoration: none;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15);
+        cursor: pointer;
+        transition: transform 0.15s, filter 0.2s;
+    }
+    #btn-consultar-keraunos:hover {
+        transform: translateY(-2px);
+        filter: brightness(1.05);
+    }
+    #btn-consultar-keraunos:active {
+        transform: scale(0.97);
+    }
+    @media (max-width: 600px) {
+        #btn-consultar-keraunos {
+            font-size: 11px;
+            padding: 7px 10px;
+        }
+    }
+</style>
 </body>
 
 </html>

@@ -1,27 +1,38 @@
 // js/alertas.js
 //
 // ============================================================
-// Sistema de Alerta Meteorológica — v3.6
+// Sistema de Alerta Meteorológica — v4.1
 // ------------------------------------------------------------
-// v3.6 (2026-10): DEGRADACIÓN SOLO PARA ALERTAS MANUALES.
-//   - Las alertas con origen === "manual" degradan:
-//       roja     → naranja (+1min) → amarilla (+1min) → libre
-//       naranja  → amarilla (+1min) → libre
-//       amarilla → libre
-//   - Las alertas del scraper (origen !== "manual") NO degradan:
-//       el contador llega a 0 y pasan a "libre" directamente.
-//   - Fix: overlay "libre" no parpadea antes de la alerta real.
+// v4.1 (2026-10): FIX DEFINITIVO del cacheo de Chrome.
+//   El background de .al-panel, #al-barra-superior y #al-tarjeta
+//   se aplica DIRECTAMENTE por JS (el.style.background = "...").
+//   Ya no se usa var(--al-color-dark) dentro del linear-gradient,
+//   porque Chrome cacheaba el valor al cambiar de amarillo.
 // ============================================================
 
 import { reproducirSonidoAlerta, detenerSonidoAlerta } from "./notifications.js";
+
+const VERDE_BASE = "#22c55e";
+
+const ZONAS_OCULTAS_MANUAL = ["Zona 4 - Tajo"];
+
+function esZonaOcultaManual(nombreZona) {
+    if (!nombreZona) return false;
+    const n = String(nombreZona).toLowerCase();
+    return ZONAS_OCULTAS_MANUAL.some(oc =>
+        oc.toLowerCase() === n ||
+        n.includes(oc.toLowerCase()) ||
+        oc.toLowerCase().includes(n)
+    );
+}
 
 // ----------------------------------------------------------
 // Niveles
 // ----------------------------------------------------------
 export const NIVELES_ALERTA = {
     vigilancia: {
-        nombre: "Vigilancia", color: "#2ecc71", colorDark: "#27ae60",
-        glow: "rgba(46,204,113,0.6)", icono: "🟢", iconoBig: "🌩️",
+        nombre: "Vigilancia", color: VERDE_BASE, colorDark: "#15803d",
+        glow: "rgba(34,197,94,0.6)", icono: "🟢", iconoBig: "🌩️",
         descripcion: "Actividad eléctrica lejana.",
         recomendacion: "Manténgase informado sobre el desarrollo del clima.",
         orden: 0
@@ -111,26 +122,97 @@ const DURACION_TIMER_MINUTOS = 15;
 const MINUTOS_DEGRADACION = 1;
 
 // ----------------------------------------------------------
-// CÁLCULO DEL NIVEL EFECTIVO (DEGRADACIÓN SOLO MANUAL)
+// APLICAR COLORES — v4.1
+// ----------------------------------------------------------
+// El background se aplica DIRECTAMENTE al elemento con el string
+// completo del gradiente. NO se usa var(--al-color-dark) dentro
+// del background porque Chrome lo cachea.
+// ----------------------------------------------------------
+function pintarBackground(elemento, nivel, esLibre = false) {
+    if (!elemento) return;
+    if (esLibre) return; // el modo libre tiene su propio CSS
+
+    // Panel del overlay: gradiente entre color claro y color oscuro
+    if (elemento.classList.contains("al-panel")) {
+        elemento.style.background = `linear-gradient(160deg, ${nivel.color}, ${nivel.colorDark})`;
+        elemento.style.borderColor = nivel.color;
+        return;
+    }
+
+    // Barra superior y tarjeta flotante: gradiente oscuro → colorDark
+    elemento.style.background = `linear-gradient(160deg, rgba(20, 20, 25, 0.96), ${nivel.colorDark})`;
+    elemento.style.borderColor = nivel.color;
+    // Border left para la tarjeta
+    if (elemento.id === "al-tarjeta") {
+        elemento.style.borderLeft = `4px solid ${nivel.color}`;
+    }
+}
+
+// Resetear el inline style para volver al CSS normal (por ejemplo, al
+// volver a "libre" que tiene su propio fondo verde).
+function resetBackground(elemento) {
+    if (!elemento) return;
+    elemento.style.background = "";
+    elemento.style.borderColor = "";
+    if (elemento.id === "al-tarjeta") {
+        elemento.style.borderLeft = "";
+    }
+}
+
+// Aplicar variables CSS (para badges, botones, etc. que SÍ funcionan con var)
+function aplicarVarsCSS(el, vars) {
+    if (!el) return;
+    vars.forEach(([k, v]) => el.style.setProperty(k, v));
+}
+
+// ----------------------------------------------------------
+// BARRERA DE ARRANQUE
+// ----------------------------------------------------------
+const arranque = {
+    esperando: true,
+    listos: new Set(),
+    timeoutId: null,
+    TIMEOUT_MS: 1500
+};
+
+export function marcarArranqueListo(fuente) {
+    if (!arranque.esperando) return;
+    arranque.listos.add(fuente);
+    if (arranque.listos.has("firestore") && arranque.listos.has("estado-cliente")) {
+        liberarArranque();
+    }
+}
+
+function liberarArranque() {
+    if (!arranque.esperando) return;
+    arranque.esperando = false;
+    if (arranque.timeoutId) {
+        clearTimeout(arranque.timeoutId);
+        arranque.timeoutId = null;
+    }
+    if (estado.zonasActivas.size === 0 && !libreYaCerradoPorUsuario) {
+        mostrarAlertaLibre(true);
+    }
+}
+
+arranque.timeoutId = setTimeout(() => {
+    if (arranque.esperando) liberarArranque();
+}, arranque.TIMEOUT_MS);
+
+// ----------------------------------------------------------
+// NIVEL EFECTIVO
 // ----------------------------------------------------------
 export function calcularNivelEfectivo(nivelOriginal, timestampInicio, duracionMin, origen = null) {
     const elapsedMin = (Date.now() - timestampInicio) / 60000;
     const D = duracionMin || DURACION_TIMER_MINUTOS;
 
-    // ⚠️ SOLO las alertas manuales degradan.
-    // Los docs del scraper (origen !== "manual") solo cuentan
-    // hacia abajo hasta "libre" y NO degradan.
     if (origen !== "manual") {
         if (elapsedMin < D) {
-            return {
-                nivel: nivelOriginal,
-                restanteSeg: Math.max(0, Math.ceil((D - elapsedMin) * 60))
-            };
+            return { nivel: nivelOriginal, restanteSeg: Math.max(0, Math.ceil((D - elapsedMin) * 60)) };
         }
         return { nivel: "libre", restanteSeg: 0 };
     }
 
-    // ---- Solo alertas MANUALES de aquí en adelante ----
     if (nivelOriginal === "roja") {
         if (elapsedMin < D)                 return { nivel: "roja",    restanteSeg: Math.max(0, Math.ceil((D - elapsedMin) * 60)) };
         if (elapsedMin < D + MINUTOS_DEGRADACION)     return { nivel: "naranja", restanteSeg: Math.max(0, Math.ceil((D + MINUTOS_DEGRADACION - elapsedMin) * 60)) };
@@ -142,7 +224,6 @@ export function calcularNivelEfectivo(nivelOriginal, timestampInicio, duracionMi
         if (elapsedMin < D + MINUTOS_DEGRADACION)     return { nivel: "amarilla",restanteSeg: Math.max(0, Math.ceil((D + MINUTOS_DEGRADACION - elapsedMin) * 60)) };
         return { nivel: "libre", restanteSeg: 0 };
     }
-    // amarilla
     if (elapsedMin < D)                     return { nivel: "amarilla", restanteSeg: Math.max(0, Math.ceil((D - elapsedMin) * 60)) };
     return { nivel: "libre", restanteSeg: 0 };
 }
@@ -256,7 +337,6 @@ async function obtenerModuloMapa() {
 function iniciarIntervalMaestro() {
     if (estado.intervalMaestro !== null) return;
     estado.intervalMaestro = setInterval(tickMaestro, 1000);
-    console.log("[alertas] interval maestro iniciado");
 }
 
 function detenerIntervalMaestro() {
@@ -270,12 +350,7 @@ async function tickMaestro() {
     const aQuitar = [];
 
     for (const [distrito, zona] of estado.zonasActivas.entries()) {
-        const ef = calcularNivelEfectivo(
-            zona.nivelKey,
-            zona.timestampInicio,
-            zona.duracionMin,
-            zona.origen
-        );
+        const ef = calcularNivelEfectivo(zona.nivelKey, zona.timestampInicio, zona.duracionMin, zona.origen);
 
         if (ef.nivel === "libre") {
             aQuitar.push(distrito);
@@ -283,9 +358,16 @@ async function tickMaestro() {
         }
 
         if (ef.nivel !== zona.nivelActual) {
-            const anterior = zona.nivelActual;
             zona.nivelActual = ef.nivel;
-            console.log(`[alertas] ${distrito}: ${anterior} → ${ef.nivel} (degradación)`);
+
+            const mod = await obtenerModuloMapa();
+            if (mod && typeof mod.pintarPoligonoZona === "function") {
+                const nivel = NIVELES_ALERTA[ef.nivel];
+                if (nivel) {
+                    try { await mod.pintarPoligonoZona(distrito, nivel.color, ef.nivel); }
+                    catch (e) {}
+                }
+            }
 
             if (estado.bannerActual === distrito) {
                 const overlay = document.getElementById("al-overlay");
@@ -307,12 +389,7 @@ async function tickMaestro() {
     if (estado.bannerActual) {
         const zona = estado.zonasActivas.get(estado.bannerActual);
         if (zona) {
-            const ef = calcularNivelEfectivo(
-                zona.nivelKey,
-                zona.timestampInicio,
-                zona.duracionMin,
-                zona.origen
-            );
+            const ef = calcularNivelEfectivo(zona.nivelKey, zona.timestampInicio, zona.duracionMin, zona.origen);
             const el = document.getElementById("al-contador");
             if (el) {
                 el.textContent = formatearTiempo(ef.restanteSeg);
@@ -334,12 +411,18 @@ function formatearTiempo(segundos) {
 }
 
 function tiempoRestanteZona(zona) {
-    return calcularNivelEfectivo(
-        zona.nivelKey,
-        zona.timestampInicio,
-        zona.duracionMin,
-        zona.origen
-    ).restanteSeg;
+    return calcularNivelEfectivo(zona.nivelKey, zona.timestampInicio, zona.duracionMin, zona.origen).restanteSeg;
+}
+
+export async function pintarZonasBaseSiProcede() {
+    try {
+        const mod = await import("./map.js");
+        if (mod && typeof mod.pintarZonasBaseVerde === "function") {
+            await mod.pintarZonasBaseVerde();
+        }
+    } catch (e) {
+        console.warn("alertas.js: no se pudo pintar zonas base:", e);
+    }
 }
 
 // ----------------------------------------------------------
@@ -347,57 +430,66 @@ function tiempoRestanteZona(zona) {
 // ----------------------------------------------------------
 export async function mostrarAlertaCompleta(datos = {}) {
     try {
+        const origen = datos.origen || null;
+        const distrito = datos.distrito || "";
+
+        if (origen === "manual" && esZonaOcultaManual(distrito)) {
+            console.log(`[alertas] Zona oculta en modo manual — se descarta: ${distrito}`);
+            return;
+        }
+
         libreYaCerradoPorUsuario = false;
         asegurarEstructuraDOM();
 
         const nivelKey = NIVELES_ALERTA[datos.nivel] ? datos.nivel : "roja";
-        const distrito = datos.distrito || `Zona ${estado.zonasActivas.size + 1}`;
+        const distritoFinal = distrito || `Zona ${estado.zonasActivas.size + 1}`;
         const duracionMin = (datos.duracionMin && datos.duracionMin > 0) ? datos.duracionMin : DURACION_TIMER_MINUTOS;
         const tsInicio = (typeof datos.timestampInicio === "number" && datos.timestampInicio > 0) ? datos.timestampInicio : Date.now();
 
-        const yaExistia = estado.zonasActivas.has(distrito);
+        const yaExistia = estado.zonasActivas.has(distritoFinal);
 
-        estado.zonasActivas.set(distrito, {
+        estado.zonasActivas.set(distritoFinal, {
             nivel: nivelKey,
             nivelKey,
             nivelActual: nivelKey,
-            distrito,
+            distrito: distritoFinal,
             lat: datos.lat ?? null,
             lng: datos.lng ?? null,
             duracionMin,
             timestampInicio: tsInicio,
-            origen: datos.origen || null,
+            origen,
             sectorOriginal: datos.sectorOriginal || null,
             inicio: datos.inicio || null,
             fin: datos.fin || null,
-            titulo: datos.titulo || `⚡ ALERTA ${nivelKey.toUpperCase()} — ${distrito}`,
-            mensaje: datos.mensaje || `Actividad eléctrica detectada en ${distrito}.`
+            titulo: datos.titulo || `⚡ ALERTA ${nivelKey.toUpperCase()} — ${distritoFinal}`,
+            mensaje: datos.mensaje || `Actividad eléctrica detectada en ${distritoFinal}.`
         });
 
         iniciarIntervalMaestro();
 
-        if (datos.distrito) {
+        if (distritoFinal) {
             const mod = await obtenerModuloMapa();
             if (mod && typeof mod.pintarPoligonoZona === "function") {
                 const nivel = NIVELES_ALERTA[nivelKey];
-                await mod.pintarPoligonoZona(datos.distrito, nivel.color);
+                try { await mod.pintarPoligonoZona(distritoFinal, nivel.color, nivelKey); }
+                catch (e) {}
             }
         }
 
         if (!yaExistia && datos.lat != null && datos.lng != null) {
             const mod = await obtenerModuloMapa();
             if (mod && typeof mod.iluminarDistrito === "function") {
-                if (capasRayos.has(distrito)) {
-                    try { capasRayos.get(distrito).detener(); } catch (e) {}
-                    capasRayos.delete(distrito);
+                if (capasRayos.has(distritoFinal)) {
+                    try { capasRayos.get(distritoFinal).detener(); } catch (e) {}
+                    capasRayos.delete(distritoFinal);
                 }
                 const capa = await mod.iluminarDistrito(datos.lat, datos.lng, nivelKey);
-                if (capa) capasRayos.set(distrito, capa);
+                if (capa) capasRayos.set(distritoFinal, capa);
             }
         }
 
         if (!yaExistia) {
-            estado.colaBanners.push(distrito);
+            estado.colaBanners.push(distritoFinal);
             estado.colaBanners.sort((a, b) => {
                 const za = estado.zonasActivas.get(a);
                 const zb = estado.zonasActivas.get(b);
@@ -408,17 +500,16 @@ export async function mostrarAlertaCompleta(datos = {}) {
 
         if (estado.bannerActual === null) {
             mostrarSiguienteBanner();
-        } else if (estado.bannerActual === distrito) {
+        } else if (estado.bannerActual === distritoFinal) {
             const overlay = document.getElementById("al-overlay");
             const estabaVisible = overlay?.classList.contains("al-visible");
-            pintarBannerDeZona(estado.zonasActivas.get(distrito), { noReabrir: !estabaVisible });
+            pintarBannerDeZona(estado.zonasActivas.get(distritoFinal), { noReabrir: !estabaVisible });
         } else {
             actualizarIndicadorCola();
         }
 
         actualizarBarraYTarjetaAgregadas();
 
-        // Sonido SOLO si es nueva alerta (no en degradaciones)
         if (!yaExistia && nivelKey !== "vigilancia") {
             try { reproducirSonidoAlerta(30); } catch (e) {}
         }
@@ -444,9 +535,20 @@ export async function quitarAlerta(distrito) {
         }
         if (!distritoReal) return false;
 
-        const mod = await obtenerModuloMapa();
-        if (mod && typeof mod.quitarPoligonoZona === "function") {
-            mod.quitarPoligonoZona(distritoReal);
+        const origen = estado.zonasActivas.get(distritoReal)?.origen || null;
+        const esOculta = origen === "manual" && esZonaOcultaManual(distritoReal);
+
+        if (!esOculta) {
+            const mod = await obtenerModuloMapa();
+            if (mod && typeof mod.pintarPoligonoZona === "function") {
+                try { await mod.pintarPoligonoZona(distritoReal, VERDE_BASE, "vigilancia"); }
+                catch (e) {}
+            }
+        } else {
+            const mod = await obtenerModuloMapa();
+            if (mod && typeof mod.quitarPoligonoZona === "function") {
+                try { mod.quitarPoligonoZona(distritoReal); } catch (e) {}
+            }
         }
 
         if (capasRayos.has(distritoReal)) {
@@ -510,23 +612,36 @@ function actualizarIndicadorCola() {
     el.textContent = `+ ${p} zona${p > 1 ? "s" : ""} en alerta`;
 }
 
+// ----------------------------------------------------------
+// PINTAR BANNER — CON BACKGROUND DIRECTO
+// ----------------------------------------------------------
 function pintarBannerDeZona(zona, opts = {}) {
     const nivelKeyActual = zona.nivelActual || zona.nivelKey;
     const nivel = NIVELES_ALERTA[nivelKeyActual];
     if (!nivel) return;
 
+    const overlayEl = document.getElementById("al-overlay");
+    const panelEl = document.getElementById("al-panel");
+    const modalEl = document.getElementById("al-modal-seguridad");
+
+    // Quitar al-libre PRIMERO para que el panel no use el fondo verde
+    overlayEl.classList.remove("al-libre");
+
+    // Aplicar BACKGROUND directamente por JS (bypass del cacheo de Chrome)
+    pintarBackground(panelEl, nivel, false);
+    if (modalEl) {
+        modalEl.style.setProperty("--al-color", nivel.color);
+    }
+
+    // Aplicar variables CSS para el resto de usos (badges, iconos, botones)
     const vars = [
         ["--al-color", nivel.color],
         ["--al-color-dark", nivel.colorDark],
         ["--al-glow", nivel.glow]
     ];
-    const aplicarVars = (el) => {
-        if (!el) return;
-        vars.forEach(([k, v]) => el.style.setProperty(k, v));
-    };
-    aplicarVars(document.getElementById("al-overlay"));
-    aplicarVars(document.getElementById("al-panel"));
-    aplicarVars(document.getElementById("al-modal-seguridad"));
+    aplicarVarsCSS(overlayEl, vars);
+    aplicarVarsCSS(panelEl, vars);
+    aplicarVarsCSS(modalEl, vars);
 
     document.getElementById("al-icono-big").textContent = nivel.iconoBig;
     document.getElementById("al-nivel-badge").textContent = nivel.nombre;
@@ -534,14 +649,11 @@ function pintarBannerDeZona(zona, opts = {}) {
     document.getElementById("al-mensaje-texto").textContent = zona.mensaje;
     document.getElementById("al-recomendacion-texto").textContent = nivel.recomendacion;
 
-    const panel = document.getElementById("al-panel");
-    panel.classList.remove("al-resplandor-activo", "al-sirena-activa");
-    void panel.offsetWidth;
+    panelEl.classList.remove("al-resplandor-activo", "al-sirena-activa");
+    void panelEl.offsetWidth;
 
-    const overlay = document.getElementById("al-overlay");
-    overlay.classList.remove("al-libre");
-    if (!opts.noReabrir) overlay.classList.add("al-visible");
-    panel.classList.add("al-sirena-activa");
+    if (!opts.noReabrir) overlayEl.classList.add("al-visible");
+    panelEl.classList.add("al-sirena-activa");
 
     if (!opts.noReabrir) activarFlashFondo();
 
@@ -581,15 +693,21 @@ function abrirOverlayLibre() {
     try {
         asegurarEstructuraDOM();
         const nivel = NIVELES_ALERTA.vigilancia;
+        const overlayEl = document.getElementById("al-overlay");
+        const panelEl = document.getElementById("al-panel");
+        const modalEl = document.getElementById("al-modal-seguridad");
+
+        // Resetear background inline para que el CSS de .al-libre tome el control
+        resetBackground(panelEl);
+
         const vars = [
             ["--al-color", nivel.color],
             ["--al-color-dark", nivel.colorDark],
             ["--al-glow", nivel.glow]
         ];
-        const aplicarVars = (el) => { if (!el) return; vars.forEach(([k, v]) => el.style.setProperty(k, v)); };
-        aplicarVars(document.getElementById("al-overlay"));
-        aplicarVars(document.getElementById("al-panel"));
-        aplicarVars(document.getElementById("al-modal-seguridad"));
+        aplicarVarsCSS(overlayEl, vars);
+        aplicarVarsCSS(panelEl, vars);
+        aplicarVarsCSS(modalEl, vars);
 
         document.getElementById("al-icono-big").textContent = "✅";
         document.getElementById("al-nivel-badge").textContent = "VIGILANCIA";
@@ -603,12 +721,10 @@ function abrirOverlayLibre() {
         const wrap = document.getElementById("al-contador-wrap");
         if (wrap) wrap.style.display = "none";
 
-        const panel = document.getElementById("al-panel");
-        panel.classList.remove("al-resplandor-activo", "al-sirena-activa");
-        void panel.offsetWidth;
+        panelEl.classList.remove("al-resplandor-activo", "al-sirena-activa");
+        void panelEl.offsetWidth;
 
-        const overlay = document.getElementById("al-overlay");
-        overlay.classList.add("al-visible", "al-libre");
+        overlayEl.classList.add("al-visible", "al-libre");
 
         const cola = document.getElementById("al-cola-indicador");
         if (cola) cola.style.display = "none";
@@ -616,7 +732,7 @@ function abrirOverlayLibre() {
 }
 
 // ----------------------------------------------------------
-// BARRA + TARJETA AGREGADAS
+// BARRA + TARJETA AGREGADAS — CON BACKGROUND DIRECTO
 // ----------------------------------------------------------
 function actualizarBarraYTarjetaAgregadas() {
     const barra = document.getElementById("al-barra-superior");
@@ -633,17 +749,21 @@ function actualizarBarraYTarjetaAgregadas() {
         if (n.orden > nivelMax.orden) nivelMax = n;
     }
 
+    barra.classList.remove("al-modo-libre");
+    tarjeta.classList.remove("al-modo-libre");
+
+    // Aplicar BACKGROUND directamente por JS
+    pintarBackground(barra, nivelMax, false);
+    pintarBackground(tarjeta, nivelMax, false);
+
+    // Aplicar variables CSS
     const vars = [
         ["--al-color", nivelMax.color],
         ["--al-color-dark", nivelMax.colorDark],
         ["--al-glow", nivelMax.glow]
     ];
-    const aplicarVars = (el) => { if (!el) return; vars.forEach(([k, v]) => el.style.setProperty(k, v)); };
-    aplicarVars(barra);
-    aplicarVars(tarjeta);
-
-    barra.classList.remove("al-modo-libre");
-    tarjeta.classList.remove("al-modo-libre");
+    aplicarVarsCSS(barra, vars);
+    aplicarVarsCSS(tarjeta, vars);
 
     document.getElementById("al-barra-icono").textContent = nivelMax.iconoBig;
 
@@ -724,12 +844,16 @@ export function mostrarBarraTarjetaLibre() {
             ["--al-color-dark", nivel.colorDark],
             ["--al-glow", nivel.glow]
         ];
-        const aplicarVars = (el) => { if (!el) return; vars.forEach(([k, v]) => el.style.setProperty(k, v)); };
 
         const barra = document.getElementById("al-barra-superior");
         const tarjeta = document.getElementById("al-tarjeta");
-        aplicarVars(barra);
-        aplicarVars(tarjeta);
+
+        // Resetear background inline → el CSS de .al-modo-libre toma el control
+        resetBackground(barra);
+        resetBackground(tarjeta);
+
+        aplicarVarsCSS(barra, vars);
+        aplicarVarsCSS(tarjeta, vars);
 
         barra?.classList.add("al-modo-libre");
         tarjeta?.classList.add("al-modo-libre");
@@ -753,17 +877,9 @@ export function mostrarBarraTarjetaLibre() {
 // ----------------------------------------------------------
 // MOSTRAR LIBRE
 // ----------------------------------------------------------
-export function mostrarAlertaLibre() {
+export function mostrarAlertaLibre(forzar = false) {
     try {
-        if (window.__estadoClienteIniciando) {
-            console.log("[alertas] posponiendo mostrarAlertaLibre (primera carga pendiente)");
-            setTimeout(() => {
-                if (window.__estadoClienteIniciando) return;
-                if (estado.zonasActivas.size > 0) return;
-                mostrarAlertaLibre();
-            }, 800);
-            return;
-        }
+        if (!forzar && arranque.esperando) return;
 
         if (libreYaCerradoPorUsuario) {
             asegurarEstructuraDOM();
@@ -783,7 +899,10 @@ export function mostrarAlertaLibre() {
         capasRayos.clear();
 
         obtenerModuloMapa().then(mod => {
-            if (mod && typeof mod.limpiarPoligonosZona === "function") mod.limpiarPoligonosZona();
+            if (!mod) return;
+            if (typeof mod.pintarZonasBaseVerde === "function") {
+                mod.pintarZonasBaseVerde().catch(() => {});
+            }
         }).catch(() => {});
 
         estado.zonasActivas.clear();
@@ -925,7 +1044,9 @@ export function cerrarAlertaTotal() {
     estado.colaBanners = [];
     estado.bannerActual = null;
     obtenerModuloMapa().then(mod => {
-        if (mod && typeof mod.limpiarPoligonosZona === "function") mod.limpiarPoligonosZona();
+        if (mod && typeof mod.pintarZonasBaseVerde === "function") {
+            mod.pintarZonasBaseVerde().catch(() => {});
+        }
     }).catch(() => {});
 }
 

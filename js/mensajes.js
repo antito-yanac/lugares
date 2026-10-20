@@ -1,20 +1,24 @@
 // js/mensajes.js
 //
 // Sistema de mensajes en tiempo real usando Firebase Firestore.
-// v3: pasa `origen` a mostrarAlertaCompleta. Los docs del scraper
-//     no llevan `origen` (null) → no degradan. Los manuales
-//     llevan `origen: "manual"` → sí degradan.
+// v5:
+//   - Lee window.__APP_CONFIG__.usarFirestore (index: true, keraunos: false).
+//   - Filtra por origen según APP_CONFIG.origenFiltro ("manual" | "scraper").
+//   - index.html: solo procesa origen === "manual".
+//   - keraunos.html: NO usa Firestore (usa estado.json).
 // ============================================================
 
 import {
     getFirestore, collection, addDoc, query, orderBy, limit,
-    onSnapshot, serverTimestamp
+    onSnapshot, serverTimestamp, doc
 } from "https://www.gstatic.com/firebasejs/12.17.0/firebase-firestore.js";
 import { obtenerApp } from "./firebase-app.js";
-import { mostrarToast, reproducirSonido, reproducirSonidoAlerta } from "./notifications.js";
-import { mostrarAlertaCompleta, mostrarAlertaLibre, quitarAlerta } from "./alertas.js";
+import { mostrarToast, reproducirSonido } from "./notifications.js";
+import { mostrarAlertaCompleta, mostrarAlertaLibre, quitarAlerta, marcarArranqueListo } from "./alertas.js";
 
 const NOMBRE_COLECCION = "mensajes_push";
+const COLECCION_SISTEMA = "sistema";
+const DOC_MODO = "estado_modo";
 const DURACION_ALERTA_MS = 15 * 60 * 1000;
 const LIMITE_DOCS = 50;
 
@@ -24,15 +28,65 @@ let primeraCarga = true;
 
 const docsProcesados = new Set();
 
+// Estado local del modo manual (leído de Firestore)
+export const estadoModo = {
+    modo: "automatico",
+    zonasActivas: [],
+    expiraEn: 0,
+    cargado: false
+};
+
 function obtenerDB() {
     if (!db) db = getFirestore(obtenerApp());
     return db;
 }
 
+function obtenerConfig() {
+    return window.__APP_CONFIG__ || {
+        origenFiltro: "manual",
+        usarFirestore: true
+    };
+}
+
+function modoEstaActivo() {
+    if (estadoModo.modo !== "manual") return false;
+    if (estadoModo.expiraEn && estadoModo.expiraEn < Date.now()) return false;
+    return true;
+}
+
+// ----------------------------------------------------------
+// Filtro por origen
+// ----------------------------------------------------------
+// Devuelve true si el doc debe procesarse en esta página.
+// - "manual": solo docs con origen === "manual".
+// - "scraper": solo docs con origen !== "manual".
+// ----------------------------------------------------------
+function debeProcesar(data) {
+    const cfg = obtenerConfig();
+    const esAlerta = data.tipo === "alerta" ||
+        (data.nivel && data.nivel !== "normal" && data.nivel !== "vigilancia");
+    const esResuelta = data.tipo === "alerta-resuelta";
+    const esNormal = !esAlerta && !esResuelta;
+
+    // Los mensajes normales (no alerta) siempre se procesan
+    if (esNormal) return true;
+
+    if (cfg.origenFiltro === "manual") {
+        return data.origen === "manual";
+    }
+    if (cfg.origenFiltro === "scraper") {
+        return data.origen !== "manual";
+    }
+    return true;
+}
+
+// ----------------------------------------------------------
+// Enviar mensaje
+// ----------------------------------------------------------
 export async function enviarMensajePush(titulo, cuerpo, datosAlerta = null) {
     const database = obtenerDB();
     const ref = collection(database, NOMBRE_COLECCION);
-    const doc = { titulo, cuerpo, fecha: serverTimestamp() };
+    const docData = { titulo, cuerpo, fecha: serverTimestamp() };
 
     if (datosAlerta) {
         if (datosAlerta.tipo !== "alerta-resuelta") {
@@ -41,15 +95,63 @@ export async function enviarMensajePush(titulo, cuerpo, datosAlerta = null) {
             }
         }
         datosAlerta.timestampInicio = Date.now();
-        Object.assign(doc, datosAlerta);
+        Object.assign(docData, datosAlerta);
     }
 
-    await addDoc(ref, doc);
+    await addDoc(ref, docData);
 }
 
+// ----------------------------------------------------------
+// Listener del flag de modo (manual / automatico)
+// ----------------------------------------------------------
+function escucharModo() {
+    try {
+        const database = obtenerDB();
+        const ref = doc(database, COLECCION_SISTEMA, DOC_MODO);
+
+        onSnapshot(ref, (snap) => {
+            if (!snap.exists()) {
+                estadoModo.modo = "automatico";
+                estadoModo.zonasActivas = [];
+                estadoModo.expiraEn = 0;
+                estadoModo.cargado = true;
+                return;
+            }
+            const data = snap.data() || {};
+            estadoModo.modo = data.modo || "automatico";
+            estadoModo.zonasActivas = Array.isArray(data.zonasActivas) ? data.zonasActivas : [];
+            estadoModo.expiraEn = (data.expiraEn && typeof data.expiraEn.toMillis === "function")
+                ? data.expiraEn.toMillis()
+                : (data.expiraEn || 0);
+            estadoModo.cargado = true;
+            console.log("[mensajes] modo actualizado:", estadoModo.modo);
+        }, (err) => {
+            console.warn("[mensajes] error leyendo modo:", err);
+            estadoModo.modo = "automatico";
+            estadoModo.cargado = true;
+        });
+    } catch (e) {
+        console.warn("[mensajes] no se pudo escuchar modo:", e);
+    }
+}
+
+// ----------------------------------------------------------
+// Escuchar mensajes
+// ----------------------------------------------------------
 export function escucharMensajesPush() {
     if (yaEscuchando) return;
     yaEscuchando = true;
+
+    const cfg = obtenerConfig();
+
+    // Si la config dice "no usar Firestore" (keraunos.html), salir temprano.
+    if (!cfg.usarFirestore) {
+        console.log("[mensajes] Firestore desactivado en esta página (keraunos.html)");
+        marcarArranqueListo("firestore"); // liberar barrera
+        return;
+    }
+
+    escucharModo();
 
     try {
         const database = obtenerDB();
@@ -59,15 +161,8 @@ export function escucharMensajesPush() {
         onSnapshot(q, (snapshot) => {
             if (primeraCarga) {
                 primeraCarga = false;
-
-                // FIX: si estado-cliente maneja la primera carga (modo
-                // index), no mostrar libre aquí para no parpadear verde.
-                if (window.__estadoClienteIniciando) {
-                    console.log("[mensajes] primera carga delegada a estado-cliente");
-                    return;
-                }
-
                 procesarPrimeraCarga(snapshot);
+                marcarArranqueListo("firestore");
                 return;
             }
 
@@ -81,15 +176,20 @@ export function escucharMensajesPush() {
             });
         }, (error) => {
             console.error("Error escuchando mensajes:", error);
+            marcarArranqueListo("firestore");
             try { mostrarAlertaLibre(); } catch (e) {}
         });
 
     } catch (error) {
         console.error("No se pudo iniciar la escucha de mensajes:", error);
+        marcarArranqueListo("firestore");
         try { mostrarAlertaLibre(); } catch (e) {}
     }
 }
 
+// ----------------------------------------------------------
+// Primera carga
+// ----------------------------------------------------------
 function procesarPrimeraCarga(snapshot) {
     const docs = snapshot.docs.map(d => ({ id: d.id, data: d.data() })).reverse();
     const estadoPorZona = new Map();
@@ -103,12 +203,14 @@ function procesarPrimeraCarga(snapshot) {
         const esNormal = !esResuelta && !esAlerta;
 
         if (esResuelta) {
+            if (!debeProcesar(data)) continue;
             const distrito = data.distrito || "";
             if (distrito) estadoPorZona.set(distrito, { tipo: "resuelta", data });
             continue;
         }
 
         if (esAlerta) {
+            if (!debeProcesar(data)) continue;
             const distrito = data.distrito || "";
             if (!distrito) continue;
 
@@ -131,12 +233,11 @@ function procesarPrimeraCarga(snapshot) {
     }
 
     const zonasActivas = [];
-    for (const [distrito, entrada] of estadoPorZona.entries()) {
+    for (const [, entrada] of estadoPorZona.entries()) {
         if (entrada.tipo === "alerta") zonasActivas.push(entrada);
     }
 
     if (zonasActivas.length === 0) {
-        mostrarAlertaLibre();
         if (mensajesNormales.length > 0) {
             setTimeout(() => {
                 mensajesNormales.slice(0, 3).forEach(m => {
@@ -152,7 +253,12 @@ function procesarPrimeraCarga(snapshot) {
     }
 }
 
+// ----------------------------------------------------------
+// Nuevo documento
+// ----------------------------------------------------------
 function procesarDocumentoNuevo(data) {
+    if (!debeProcesar(data)) return;
+
     const titulo = data.titulo || "🔔 Notificación";
     const cuerpo = data.cuerpo || "";
 
@@ -171,7 +277,6 @@ function procesarDocumentoNuevo(data) {
         reproducirSonido();
         const duracionMin = data.duracionMin || 15;
         const tsInicio = (typeof data.timestampInicio === "number") ? data.timestampInicio : null;
-
         mostrarAlertaActiva(data, duracionMin, tsInicio);
 
         if ("Notification" in window && Notification.permission === "granted") {

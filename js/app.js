@@ -1,9 +1,12 @@
 //======================================================
 // Buscador Lugares Antamina 2026
 // Archivo principal
+// v4: en modo "keraunos" (keraunos.html) NO carga lugares.json
+//     ni el buscador. Solo crea el mapa, pinta zonas2.json y
+//     arranca estado-cliente para leer estado.json.
 //======================================================
 
-import { cargarLugares, obtenerCarpetas } from "./data.js";   // ⬅️ CORREGIDO
+import { cargarLugares } from "./data.js";
 import { crearBuscador, teclado } from "./search.js";
 import { crearMapa } from "./map.js";
 import { inicializarFirebase } from "./notifications.js";
@@ -11,19 +14,30 @@ import { escucharMensajesPush } from "./mensajes.js";
 import { mostrarAlertaCompleta, cerrarAlertaTotal, mostrarAlertaLibre } from "./alertas.js";
 import { iniciarEstadoCliente } from "./estado-cliente.js";
 
+// Leer configuración (o defaults si no existe)
+const CONFIG = window.__APP_CONFIG__ || {
+    modo: "manual",
+    zonasFile: "./zonas.json",
+    origenFiltro: "manual",
+    usarFirestore: true,
+    usarEstadoJSON: false
+};
+
+console.log(`[app] modo: ${CONFIG.modo} | zonas: ${CONFIG.zonasFile} | filtro: ${CONFIG.origenFiltro}`);
+
 //======================================================
 // Referencias HTML
 //======================================================
 
-const input   = document.getElementById("search");
-const stats   = document.getElementById("stats");
+const input = document.getElementById("search");
+const stats = document.getElementById("stats");
 const results = document.getElementById("results");
 
 //======================================================
 
 let lugares = [];
-let buscar  = null;
-let mapa    = null;
+let buscar = null;
+let mapa = null;
 
 //======================================================
 // Inicio
@@ -33,6 +47,45 @@ async function iniciar() {
 
     try {
 
+        // ==================================================
+        // MODO KERAUNOS (keraunos.html)
+        // - Sin buscador, sin lugares.json
+        // - Solo mapa + zonas2.json + estado.json
+        // ==================================================
+        if (CONFIG.modo === "keraunos") {
+            console.log("[app] modo keraunos: sin buscador ni lugares.json");
+
+            // Ocultar el buscador y stats (por si acaso el HTML los tiene)
+            if (input) input.closest(".search-box")?.style.setProperty("display", "none");
+            if (results) results.style.setProperty("display", "none");
+            if (stats) stats.style.setProperty("display", "none");
+
+            mapa = crearMapa("map");
+
+            // Pintar las 4 zonas de zonas2.json en verde
+            try {
+                const mod = await import("./map.js");
+                if (mod && typeof mod.pintarZonasBaseVerde === "function") {
+                    await mod.pintarZonasBaseVerde();
+                }
+            } catch (e) {
+                console.warn("[app] No se pudieron pintar las zonas base:", e);
+            }
+
+            // Arrancar estado-cliente (lee estado.json cada 30 s)
+            try {
+                iniciarEstadoCliente({ modo: "index" });
+            } catch (e) {
+                console.warn("[app] estado-cliente no arrancó:", e);
+            }
+
+            // No hacer nada más. Sin buscador, sin Firestore, sin lugares.json.
+            return;
+        }
+
+        // ==================================================
+        // MODO MANUAL (index.html) — comportamiento original
+        // ==================================================
         stats.textContent = "Cargando lugares...";
 
         lugares = await cargarLugares();
@@ -45,51 +98,55 @@ async function iniciar() {
 
         stats.textContent = `${lugares.length} lugares cargados`;
 
-        // ⬅️ NUEVO: activar filtros de carpeta + tipo
-        inicializarFiltros(lugares, mapa);
+        // Firestore: solo si la config lo pide
+        if (CONFIG.usarFirestore) {
+            escucharMensajesPush();
+            inicializarFirebase().catch(err => console.warn("Firebase:", err.message));
+        }
 
-        // Escuchar mensajes push en tiempo real (Firestore).
-        escucharMensajesPush();
+        // estado.json: solo si la config lo pide (index no lo usa)
+        if (CONFIG.usarEstadoJSON) {
+            try {
+                iniciarEstadoCliente({ modo: "index" });
+            } catch (e) {
+                console.warn("estado-cliente no arrancó:", e);
+            }
+        }
 
-        // Habilitar Firebase Messaging
-        inicializarFirebase().catch(err => console.warn("Firebase:", err.message));
-
-        // Respaldo del cliente Keraunos
+        // Pintar las zonas base (zonas.json, 3 zonas en modo manual)
         try {
-            iniciarEstadoCliente({ modo: "index" });
+            const mod = await import("./map.js");
+            if (mod && typeof mod.pintarZonasBaseVerde === "function") {
+                await mod.pintarZonasBaseVerde();
+            }
         } catch (e) {
-            console.warn("estado-cliente (index) no arrancó:", e);
+            console.warn("No se pudieron pintar las zonas base:", e);
         }
 
     } catch (error) {
-
         console.error(error);
-
-        stats.textContent = "Error cargando lugares";
-
+        if (stats) stats.textContent = "Error cargando lugares.json";
     }
-
 }
 
 //======================================================
-// Eventos
+// Eventos (solo si existen los elementos — en keraunos.html no existen)
 //======================================================
 
-input.addEventListener("input", buscarTexto);
-input.addEventListener("keydown", controlarTeclado);
+if (input) {
+    input.addEventListener("input", buscarTexto);
+    input.addEventListener("keydown", controlarTeclado);
+}
 
 //======================================================
 // Buscar
 //======================================================
 
 function buscarTexto() {
-
+    if (!buscar || !input) return;
     const texto = input.value.trim();
-
     cambiarColorFondo(texto);
-
     buscar(texto, results, mapa, stats);
-
 }
 
 //======================================================
@@ -97,6 +154,7 @@ function buscarTexto() {
 //======================================================
 
 function controlarTeclado(e) {
+    if (!mapa) return;
     teclado(e, mapa);
 }
 
@@ -105,15 +163,12 @@ function controlarTeclado(e) {
 //======================================================
 
 function cambiarColorFondo(texto) {
-
     if (texto.length === 0) {
         document.body.style.backgroundColor = "#2c3e50";
         return;
     }
-
     const tono = (texto.length * 18) % 360;
     document.body.style.backgroundColor = `hsl(${tono},45%,30%)`;
-
 }
 
 //======================================================
@@ -121,14 +176,9 @@ function cambiarColorFondo(texto) {
 //======================================================
 
 function configurarBotonConsulta() {
-
     const btn = document.getElementById("btn-test-alerta");
     if (!btn) return;
-
-    btn.addEventListener("click", () => {
-        consultarEstadoAlerta();
-    });
-
+    btn.addEventListener("click", () => consultarEstadoAlerta());
 }
 
 async function consultarEstadoAlerta() {
@@ -170,7 +220,8 @@ async function consultarEstadoAlerta() {
                             timestampInicio: timestampInicio,
                             sectorOriginal:  data.sectorOriginal || null,
                             inicio:          data.inicio || null,
-                            fin:             data.fin || null
+                            fin:             data.fin || null,
+                            origen:          data.origen || null
                         });
                         return;
                     }
@@ -187,7 +238,8 @@ async function consultarEstadoAlerta() {
                         timestampInicio: fechaDoc,
                         sectorOriginal:  data.sectorOriginal || null,
                         inicio:          data.inicio || null,
-                        fin:             data.fin || null
+                        fin:             data.fin || null,
+                        origen:          data.origen || null
                     });
                     return;
                 }
@@ -204,71 +256,6 @@ async function consultarEstadoAlerta() {
 
 configurarBotonConsulta();
 
-//======================================================
-// ⬅️ NUEVO: Filtros de carpeta + tipo
-//======================================================
-
-function inicializarFiltros(lugares, mapa) {
-    const selectCarpeta = document.getElementById("folder-select");
-    const botonesTipo   = document.querySelectorAll(".type-btn");
-
-    if (!selectCarpeta) {
-        console.warn("app.js: no existe #folder-select");
-        return;
-    }
-    if (!mapa || typeof mapa.filtrarLugares !== "function") {
-        console.warn("app.js: mapa.filtrarLugares no disponible");
-        return;
-    }
-
-    const carpetas = obtenerCarpetas(lugares);
-    console.info(`app.js: ${carpetas.length} carpetas detectadas`, carpetas);
-
-    selectCarpeta.innerHTML =
-        `<option value="__all__">📁 Todas las carpetas</option>` +
-        carpetas.map(c =>
-            `<option value="${escapeHtml(c)}">📁 ${escapeHtml(c)}</option>`
-        ).join("");
-
-    let filtroCarpeta = "__all__";
-    let filtroTipo    = "all";
-
-    function aplicar() {
-        const visibles = mapa.filtrarLugares(props => {
-            const okCarpeta =
-                filtroCarpeta === "__all__" ||
-                (props.carpeta || "(Raíz)") === filtroCarpeta;
-            const okTipo =
-                filtroTipo === "all" ||
-                props.tipo === filtroTipo;
-            return okCarpeta && okTipo;
-        });
-        document.getElementById("stats").textContent = `${visibles} lugares visibles`;
-    }
-
-    selectCarpeta.addEventListener("change", e => {
-        filtroCarpeta = e.target.value;
-        aplicar();
-    });
-
-    botonesTipo.forEach(btn => {
-        btn.addEventListener("click", () => {
-            botonesTipo.forEach(b => b.classList.remove("active"));
-            btn.classList.add("active");
-            filtroTipo = btn.dataset.type;
-            aplicar();
-        });
-    });
-}
-
-function escapeHtml(str) {
-    return String(str)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
-}
 //======================================================
 
 iniciar();
